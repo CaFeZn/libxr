@@ -4,6 +4,17 @@ using namespace LibXR;
 
 namespace
 {
+ErrorCode ValidateConfiguration(const Watchdog::Configuration& config)
+{
+  if (config.timeout_ms == 0u || config.feed_ms == 0u ||
+      config.feed_ms > config.timeout_ms)
+  {
+    return ErrorCode::ARG_ERR;
+  }
+
+  return ErrorCode::OK;
+}
+
 #if LIBXR_HPM_EWDG_SUPPORTED
 constexpr uint32_t kMillisecondsPerSecond = 1000u;
 constexpr uint32_t kEwdgOsc32kHz = 32768u;
@@ -117,10 +128,10 @@ ErrorCode HPMWatchdog::ConvertStatus(hpm_stat_t status)
 
 ErrorCode HPMWatchdog::SetConfig(const Configuration& config)
 {
-  if (config.timeout_ms == 0u || config.feed_ms == 0u ||
-      config.feed_ms > config.timeout_ms)
+  ErrorCode ans = ValidateConfiguration(config);
+  if (ans != ErrorCode::OK)
   {
-    return ErrorCode::ARG_ERR;
+    return ans;
   }
 
 #if LIBXR_HPM_EWDG_SUPPORTED
@@ -129,7 +140,7 @@ ErrorCode HPMWatchdog::SetConfig(const Configuration& config)
     return ErrorCode::PTR_NULL;
   }
 
-  ErrorCode ans = EnsureClockReady();
+  ans = EnsureClockReady();
   if (ans != ErrorCode::OK)
   {
     return ans;
@@ -254,7 +265,13 @@ ErrorCode HPMWatchdog::ResolveTimeoutSetting(uint32_t timeout_ms,
 
 ErrorCode HPMWatchdog::ApplyConfiguration(bool enable_watchdog)
 {
-  ErrorCode ans = EnsureClockReady();
+  ErrorCode ans = ValidateConfiguration(current_config_);
+  if (ans != ErrorCode::OK)
+  {
+    return ans;
+  }
+
+  ans = EnsureClockReady();
   if (ans != ErrorCode::OK)
   {
     return ans;
