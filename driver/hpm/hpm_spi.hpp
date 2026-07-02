@@ -5,18 +5,18 @@
  * @brief HPM SPI 主机驱动适配头文件 / Adapter header for the HPM SPI master driver.
  *
  * @details
- * 本文件在 HPM SDK `hpm_spi_drv` 之上实现 LibXR `SPI` 抽象，默认采用阻塞式
- * master 传输，并可在工程启用 `USE_DMA_MGR=1` 时为普通 data-phase 流式传输打开
- * HPM SDK SPI component DMA manager 路径。驱动把 CPOL/CPHA、分频、8-bit 命令式
+ * 本文件在 HPM SDK `hpm_spi_drv` 之上实现 LibXR `SPI` 抽象，默认按传输长度在
+ * 阻塞式 master 传输和 HPM SDK SPI component DMA manager 路径间自动选择。
+ * 驱动把 CPOL/CPHA、分频、8-bit 命令式
  * 寄存器访问、SPI flash command phase helper 和 SDK 状态码映射到 LibXR API。
  * 多系列兼容依赖 `HPMSOC_HAS_HPMSDK_SPI`、`__has_include("hpm_spi_drv.h")`、
  * 构造参数传入的实例/clock，以及 `SPI_SOC_TRANSFER_COUNT_MAX` 等 SDK header
  * 限制宏；真实片选、波形和错误恢复仍需 board 级验证。
  *
  * This file implements the LibXR `SPI` abstraction on top of the HPM SDK
- * `hpm_spi_drv` APIs. The default backend uses blocking master transfers, and
- * projects built with `USE_DMA_MGR=1` may explicitly enable the HPM SDK SPI
- * component DMA-manager path for regular data-phase stream transfers. The driver
+ * `hpm_spi_drv` APIs. The default backend automatically selects between blocking
+ * master transfers and the HPM SDK SPI component DMA-manager path by transfer size.
+ * The driver
  * maps CPOL/CPHA, prescaler selection, 8-bit command-style register access,
  * SPI-flash command-phase helpers, and SDK status codes into the LibXR API.
  * Multi-series compatibility relies on `HPMSOC_HAS_HPMSDK_SPI`,
@@ -63,20 +63,19 @@ namespace LibXR
  * This class owns one HPM SPI peripheral instance and provides stream transfers
  * and simple register-style SPI access.
  *
- * 默认实现调用 HPM SDK 阻塞式传输 API；显式调用 SetDmaEnabled(true) 后，
- * ReadAndWrite() 和 Transfer() 会使用 HPM SDK SPI component 的 DMA manager
- * nonblocking data-phase API，直到 DMA 回调完成前同一实例的其它事务会返回 BUSY。
- * CommandRead()、CommandWriteRead()、MemRead() 和 MemWrite() 保持阻塞路径。
- * The default implementation calls HPM SDK blocking transfer APIs. After
- * SetDmaEnabled(true), ReadAndWrite() and Transfer() use the HPM SDK SPI component
- * DMA-manager nonblocking data-phase APIs, and other transactions on the same
- * instance return BUSY until the DMA callback completes. CommandRead(),
- * CommandWriteRead(), MemRead(), and MemWrite() stay on the blocking path.
+  * 默认实现按传输长度自动选择 HPM SDK 阻塞式传输 API 或 SPI component DMA manager
+  * nonblocking data-phase API；直到 DMA 回调完成前同一实例的其它事务会返回 BUSY。
+  * CommandRead()、CommandWriteRead()、MemRead() 和 MemWrite() 保持阻塞路径。
+  * The default implementation automatically selects the HPM SDK blocking transfer
+  * APIs or SPI component DMA-manager nonblocking data-phase APIs by transfer size,
+  * and other transactions on the same instance return BUSY until the DMA callback
+  * completes. CommandRead(), CommandWriteRead(), MemRead(), and MemWrite() stay on
+  * the blocking path.
  *
- * 支持 LibXR 操作模式参数；默认同步完成，DMA 启用后仅流式传输可后台完成 /
- * LibXR operation mode parameters are accepted; transfers complete synchronously
- * by default, and only stream transfers may complete in the background when DMA is
- * enabled:
+  * 支持 LibXR 操作模式参数；小包同步完成，自动 DMA 选中的流式传输可后台完成 /
+  * LibXR operation mode parameters are accepted; small transfers complete
+  * synchronously, and stream transfers selected for automatic DMA may complete in the
+  * background:
  * - BLOCK：直接返回最终 ErrorCode，不触发回调或状态更新 /
  *   BLOCK: returns the final ErrorCode directly without callback/status update.
  * - POLLING：同步路径返回前更新为 DONE/ERROR；DMA 路径先标记
@@ -106,7 +105,8 @@ namespace LibXR
  * APIs return `NOT_SUPPORT`, avoiding direct glob-build failures on SoCs or trimmed
  * SDKs without SPI.
  *
- * `SetChipSelect()`, `SetDmaEnabled()`, `IsDmaEnabled()`, `IsDmaSupported()`,
+  * `SetChipSelect()`, `SetDmaEnabled()`, `SetDmaEnableMinSize()`, `IsDmaEnabled()`,
+  * `IsDmaSupported()`,
  * `CommandRead()`, and `CommandWriteRead()` are HPM-specific convenience
  * extensions. They are intentionally not part of the generic `SPI` virtual
  * interface in `src/driver/spi.hpp`.
@@ -157,16 +157,20 @@ class HPMSPI final : public SPI
    * @param cs 硬件片选线；仅在 HPM SDK/SoC 暴露 `cs_index` 时写入控制寄存器 /
    * Hardware chip-select line. It is written to the transfer control register only
    * when the HPM SDK/SoC exposes `cs_index`.
+   * @param dma_enable_min_size 自动 DMA 最小长度，语义与 STM32SPI 相同：传输长度
+   * 大于该值时尝试 DMA；0 表示所有非零流式传输都可走 DMA /
+   * Minimum size for automatic DMA, matching STM32SPI semantics: transfers larger
+   * than this value try DMA; 0 allows every non-zero stream transfer to use DMA.
    *
    * @note 构造函数会断言外设指针为空、暂存缓冲区为空、源时钟无法解析或初始配置无效 /
    * The constructor asserts on null peripheral pointer, null/empty staging buffers,
    * unresolved source clock, or invalid initial configuration.
    */
   HPMSPI(LibXRHpmSpiType* spi, clock_name_t clock, RawData rx_buffer, RawData tx_buffer,
-         bool auto_board_init = true,
-         SPI::Configuration config = {SPI::ClockPolarity::LOW, SPI::ClockPhase::EDGE_1,
-                                      SPI::Prescaler::DIV_4, false},
-         ChipSelect cs = ChipSelect::CS0);
+          bool auto_board_init = true,
+          SPI::Configuration config = {SPI::ClockPolarity::LOW, SPI::ClockPhase::EDGE_1,
+                                       SPI::Prescaler::DIV_4, false},
+          ChipSelect cs = ChipSelect::CS0, uint32_t dma_enable_min_size = 3);
 
   /**
    * @brief 传输 SPI 字节，并可同时采集接收数据 /
@@ -249,8 +253,8 @@ class HPMSPI final : public SPI
   ChipSelect GetChipSelect() const { return cs_; }
 
   /**
-   * @brief 启用或关闭 HPM SPI DMA manager 路径 /
-   * Enable or disable the HPM SPI DMA-manager path.
+   * @brief 启用或关闭 HPM SPI 自动 DMA manager 路径 /
+   * Enable or disable the HPM SPI automatic DMA-manager path.
    *
    * DMA 路径仅在工程启用 `USE_DMA_MGR=1` 且 HPM SDK 提供 `hpm_spi.h`
    * 组件 API 时可用。它只覆盖普通 data-phase 流式传输，即 ReadAndWrite() 和
@@ -263,14 +267,28 @@ class HPMSPI final : public SPI
    * CommandRead() / CommandWriteRead() keep using the blocking HPM SDK command
    * phase so SPI-flash opcode-read timing remains unchanged.
    *
-   * @param enabled true 启用 DMA，false 回到同步阻塞路径 /
-   * true to enable DMA, false to use the synchronous blocking path.
+   * @param enabled true 启用自动 DMA，false 强制同步阻塞路径 /
+   * true to enable automatic DMA, false to force the synchronous blocking path.
    * @return OK 表示状态已更新；BUSY 表示有后台 DMA 事务未完成；NOT_SUPPORT 表示
    * 当前构建未提供 SPI DMA manager 支持 /
    * OK when updated, BUSY while an async DMA transaction is active, or
    * NOT_SUPPORT when this build does not provide SPI DMA-manager support.
    */
   ErrorCode SetDmaEnabled(bool enabled);
+
+  /**
+   * @brief 设置自动 DMA 最小传输长度 / Set the automatic DMA minimum transfer size.
+   *
+   * 语义与 STM32SPI 的 dma_enable_min_size 一致：有效传输长度大于该值时尝试 DMA。
+   * This matches STM32SPI's dma_enable_min_size semantics: effective transfer sizes
+   * greater than this threshold try DMA.
+   */
+  ErrorCode SetDmaEnableMinSize(uint32_t size);
+
+  /**
+   * @brief 获取自动 DMA 最小传输长度 / Get the automatic DMA minimum transfer size.
+   */
+  uint32_t GetDmaEnableMinSize() const { return dma_enable_min_size_; }
 
   /**
    * @brief 查询当前是否启用 DMA 流式传输 / Query whether DMA stream transfers are
@@ -588,6 +606,11 @@ class HPMSPI final : public SPI
                                uint8_t* rx, uint32_t rx_size);
 
 #if LIBXR_HPM_SPI_HAS_DMA_MGR
+  bool ShouldUseDma(size_t size) const
+  {
+    return dma_enabled_ && size > dma_enable_min_size_;
+  }
+
   /**
    * @brief HPM SPI DMA 后台事务类型 / HPM SPI DMA background transfer kind.
    */
@@ -673,7 +696,8 @@ class HPMSPI final : public SPI
   /**
    * @brief 完成并分发 DMA 事务结果 / Complete and dispatch a DMA transaction result.
    */
-  void CompleteDmaTransfer(bool in_isr, ErrorCode ans);
+  ErrorCode CompleteDmaTransfer(bool in_isr, ErrorCode ans,
+                                bool notify_block = true);
 
   /**
    * @brief 抢占 DMA 完成所有权 / Claim single DMA completion ownership.
@@ -698,7 +722,9 @@ class HPMSPI final : public SPI
   size_t tx_buffer_capacity_ = 0;  ///< 原始 TX 缓冲区容量 / Raw TX buffer capacity.
   bool configured_ = false;        ///< 是否已有成功配置 / Whether a config was applied.
   bool dma_enabled_ =
-      false;  ///< 是否启用 DMA 流式传输 / Whether DMA stream path is enabled.
+      true;  ///< 是否启用自动 DMA 流式传输 / Whether automatic DMA stream path is enabled.
+  uint32_t dma_enable_min_size_ =
+      3;  ///< 自动 DMA 最小传输长度 / Minimum automatic DMA transfer size.
 #if LIBXR_HPM_SPI_HAS_DMA_MGR
   bool dma_ready_ =
       false;  ///< DMA manager 回调是否已安装 / Whether DMA callbacks are installed.

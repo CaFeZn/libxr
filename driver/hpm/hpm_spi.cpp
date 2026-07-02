@@ -114,12 +114,14 @@ void InvalidateDCacheIfNeeded(const void* addr, uint32_t size)
 }  // namespace
 
 HPMSPI::HPMSPI(SPI_Type* spi, clock_name_t clock, RawData rx_buffer, RawData tx_buffer,
-               bool auto_board_init, SPI::Configuration config, ChipSelect cs)
+               bool auto_board_init, SPI::Configuration config, ChipSelect cs,
+               uint32_t dma_enable_min_size)
     : SPI(rx_buffer, tx_buffer),
       spi_(spi),
       clock_(clock),
       rx_buffer_capacity_(rx_buffer.size_),
       tx_buffer_capacity_(tx_buffer.size_),
+      dma_enable_min_size_(dma_enable_min_size),
       auto_board_init_(auto_board_init),
       cs_(cs)
 {
@@ -461,6 +463,18 @@ ErrorCode HPMSPI::SetDmaEnabled(bool enabled)
 #endif
 }
 
+ErrorCode HPMSPI::SetDmaEnableMinSize(uint32_t size)
+{
+#if LIBXR_HPM_SPI_HAS_DMA_MGR
+  if (DmaTransferActive())
+  {
+    return ErrorCode::BUSY;
+  }
+#endif
+  dma_enable_min_size_ = size;
+  return ErrorCode::OK;
+}
+
 #if LIBXR_HPM_SPI_HAS_DMA_MGR
 ErrorCode HPMSPI::ConvertDmaStatus(hpm_stat_t status)
 {
@@ -666,10 +680,17 @@ ErrorCode HPMSPI::StartDmaTransfer(uint8_t* rx, uint8_t* tx, uint32_t size,
 
 ErrorCode HPMSPI::WaitForDmaBlockResult(uint32_t timeout)
 {
-  const ErrorCode ans = dma_block_wait_.Wait(timeout);
-  if (ans == ErrorCode::TIMEOUT && DmaTransferActive())
+  ErrorCode ans = dma_block_wait_.Wait(timeout);
+  if (DmaTransferActive())
   {
-    CompleteDmaTransfer(false, ErrorCode::TIMEOUT);
+    if (ans == ErrorCode::OK)
+    {
+      ans = CompleteDmaTransfer(false, ErrorCode::OK, false);
+    }
+    else if (ans == ErrorCode::TIMEOUT)
+    {
+      ans = CompleteDmaTransfer(false, ErrorCode::TIMEOUT, false);
+    }
   }
   return ans;
 }
@@ -701,15 +722,22 @@ void HPMSPI::MaybeCompleteDmaTransfer(bool in_isr)
 
   if (ready)
   {
-    CompleteDmaTransfer(in_isr, ErrorCode::OK);
+    if (dma_ctx_.op.type == OperationRW::OperationType::BLOCK)
+    {
+      (void)dma_block_wait_.TryPost(in_isr, ErrorCode::OK);
+    }
+    else
+    {
+      (void)CompleteDmaTransfer(in_isr, ErrorCode::OK);
+    }
   }
 }
 
-void HPMSPI::CompleteDmaTransfer(bool in_isr, ErrorCode ans)
+ErrorCode HPMSPI::CompleteDmaTransfer(bool in_isr, ErrorCode ans, bool notify_block)
 {
   if (!TryClaimDmaCompletion())
   {
-    return;
+    return ans;
   }
 
   DmaTransferKind kind = dma_ctx_.kind;
@@ -764,12 +792,16 @@ void HPMSPI::CompleteDmaTransfer(bool in_isr, ErrorCode ans)
 
   if (op.type == OperationRW::OperationType::BLOCK)
   {
-    (void)dma_block_wait_.TryPost(in_isr, ans);
+    if (notify_block)
+    {
+      (void)dma_block_wait_.TryPost(in_isr, ans);
+    }
   }
   else
   {
     op.UpdateStatus(in_isr, ans);
   }
+  return ans;
 }
 
 void HPMSPI::OnRxDmaTcCallback(DMA_Type* base, uint32_t channel, void* cb_data_ptr)
@@ -968,7 +1000,7 @@ ErrorCode HPMSPI::ReadAndWrite(RawData read_data, ConstRawData write_data,
   }
 
 #if LIBXR_HPM_SPI_HAS_DMA_MGR
-  if (dma_enabled_)
+  if (ShouldUseDma(need))
   {
     DmaTransferKind kind = DmaTransferKind::WRITE_ONLY;
     if (read_data.size_ > 0 && write_data.size_ > 0)
@@ -1132,7 +1164,7 @@ ErrorCode HPMSPI::Transfer(size_t size, OperationRW& op, bool in_isr)
   }
 
 #if LIBXR_HPM_SPI_HAS_DMA_MGR
-  if (dma_enabled_)
+  if (ShouldUseDma(size))
   {
     return StartDmaTransfer(static_cast<uint8_t*>(rx.addr_),
                             static_cast<uint8_t*>(tx.addr_), static_cast<uint32_t>(size),
