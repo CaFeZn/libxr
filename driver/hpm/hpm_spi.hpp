@@ -66,14 +66,14 @@ namespace LibXR
  * This class owns one HPM SPI peripheral instance and provides stream transfers
  * and simple register-style SPI access.
  *
-  * 默认实现按传输长度自动选择 HPM SDK 阻塞式传输 API 或 SPI component DMA manager
-  * nonblocking data-phase API；直到 DMA 回调完成前同一实例的其它事务会返回 BUSY。
-  * CommandRead() 和 CommandWriteRead() 保持阻塞 command-phase 路径。
+  * 默认实现按传输长度自动选择 HPM SDK 阻塞式传输 API 或可选的 SPI component DMA
+  * manager nonblocking data-phase API；直到 DMA 回调完成前同一实例的其它事务会返回
+  * BUSY。CommandRead() 和 CommandWriteRead() 保持阻塞 command-phase 路径。
   * The default implementation automatically selects the HPM SDK blocking transfer
-  * APIs or SPI component DMA-manager nonblocking data-phase APIs by transfer size,
-  * and other transactions on the same instance return BUSY until the DMA callback
-  * completes. CommandRead() and CommandWriteRead() stay on the blocking command-phase
-  * path.
+  * APIs or the optional SPI component DMA-manager nonblocking data-phase APIs by
+  * transfer size, and other transactions on the same instance return BUSY until the
+  * DMA callback completes. CommandRead() and CommandWriteRead() stay on the blocking
+  * command-phase path.
  *
   * 支持 LibXR 操作模式参数；小包同步完成，自动 DMA 选中的流式传输可后台完成 /
   * LibXR operation mode parameters are accepted; small transfers complete
@@ -163,6 +163,10 @@ class HPMSPI final : public SPI
    * 大于该值时尝试 DMA；0 表示所有非零流式传输都可走 DMA /
    * Minimum size for automatic DMA, matching STM32SPI semantics: transfers larger
    * than this value try DMA; 0 allows every non-zero stream transfer to use DMA.
+   * @param dma_enabled 是否启用自动 DMA；未构建 DMA manager 支持时会被强制视为
+   * false，所有传输走同步阻塞路径 / Whether automatic DMA is enabled. When DMA-manager
+   * support is not built in, it is forced to false and all transfers use the
+   * synchronous blocking path.
    *
    * @note 构造函数会断言外设指针为空、暂存缓冲区为空、源时钟无法解析或初始配置无效 /
    * The constructor asserts on null peripheral pointer, null/empty staging buffers,
@@ -172,7 +176,8 @@ class HPMSPI final : public SPI
           bool auto_board_init = true,
           SPI::Configuration config = {SPI::ClockPolarity::LOW, SPI::ClockPhase::EDGE_1,
                                        SPI::Prescaler::DIV_4, false},
-          ChipSelect cs = ChipSelect::CS0, uint32_t dma_enable_min_size = 3);
+          ChipSelect cs = ChipSelect::CS0, uint32_t dma_enable_min_size = 3,
+          bool dma_enabled = (LIBXR_HPM_SPI_HAS_DMA_MGR != 0));
 
   /**
    * @brief 传输 SPI 字节，并可同时采集接收数据 /
@@ -736,8 +741,9 @@ class HPMSPI final : public SPI
   size_t rx_buffer_capacity_ = 0;  ///< 原始 RX 缓冲区容量 / Raw RX buffer capacity.
   size_t tx_buffer_capacity_ = 0;  ///< 原始 TX 缓冲区容量 / Raw TX buffer capacity.
   bool configured_ = false;        ///< 是否已有成功配置 / Whether a config was applied.
-  bool dma_enabled_ =
-      true;  ///< 是否启用自动 DMA 流式传输 / Whether automatic DMA stream path is enabled.
+  bool dma_enabled_ = (LIBXR_HPM_SPI_HAS_DMA_MGR != 0);  ///< 是否启用自动 DMA 流式传输 /
+                                                        ///< Whether automatic DMA stream
+                                                        ///< path is enabled.
   uint32_t dma_enable_min_size_ =
       3;  ///< 自动 DMA 最小传输长度 / Minimum automatic DMA transfer size.
 #if LIBXR_HPM_SPI_HAS_DMA_MGR

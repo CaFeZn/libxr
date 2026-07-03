@@ -115,12 +115,13 @@ void InvalidateDCacheIfNeeded(const void* addr, uint32_t size)
 
 HPMSPI::HPMSPI(SPI_Type* spi, clock_name_t clock, RawData rx_buffer, RawData tx_buffer,
                bool auto_board_init, SPI::Configuration config, ChipSelect cs,
-               uint32_t dma_enable_min_size)
+               uint32_t dma_enable_min_size, bool dma_enabled)
     : SPI(rx_buffer, tx_buffer),
       spi_(spi),
       clock_(clock),
       rx_buffer_capacity_(rx_buffer.size_),
       tx_buffer_capacity_(tx_buffer.size_),
+      dma_enabled_(dma_enabled && (LIBXR_HPM_SPI_HAS_DMA_MGR != 0)),
       dma_enable_min_size_(dma_enable_min_size),
       auto_board_init_(auto_board_init),
       cs_(cs)
