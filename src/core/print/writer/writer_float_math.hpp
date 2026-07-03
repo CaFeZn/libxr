@@ -4,6 +4,9 @@
  * @brief 通用浮点文本格式化器使用的数学辅助函数。 / Math helpers used by the generic float text formatter.
  */
 
+#include <cmath>
+#include <type_traits>
+
 namespace Detail
 {
 template <typename Float>
