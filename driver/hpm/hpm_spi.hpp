@@ -26,24 +26,26 @@
  * validation.
  */
 
+#include "hpm_soc.h"
+
+#if defined(HPMSOC_HAS_HPMSDK_SPI) && __has_include("hpm_spi_drv.h")
+#define LIBXR_HPM_SPI_SUPPORTED 1
+#else
+#define LIBXR_HPM_SPI_SUPPORTED 0
+#endif
+
+#if LIBXR_HPM_SPI_SUPPORTED
+
 #include <atomic>
 
 #include "hpm_clock_drv.h"
-#include "hpm_soc.h"
+#include "hpm_spi_drv.h"
 #include "spi.hpp"
 
-#if defined(HPMSOC_HAS_HPMSDK_SPI) && __has_include("hpm_spi_drv.h")
-#include "hpm_spi_drv.h"
-#define LIBXR_HPM_SPI_SUPPORTED 1
 using LibXRHpmSpiType = SPI_Type;
 using LibXRHpmSpiStatusType = hpm_stat_t;
-#else
-#define LIBXR_HPM_SPI_SUPPORTED 0
-using LibXRHpmSpiType = void;
-using LibXRHpmSpiStatusType = int;
-#endif
 
-#if LIBXR_HPM_SPI_SUPPORTED && defined(USE_DMA_MGR) && (USE_DMA_MGR) && \
+#if defined(USE_DMA_MGR) && (USE_DMA_MGR) && \
     __has_include("hpm_spi.h") && __has_include("hpm_dma_mgr.h")
 #include "hpm_spi.h"
 #define LIBXR_HPM_SPI_HAS_DMA_MGR 1
@@ -97,13 +99,12 @@ namespace LibXR
  * itself does not branch by HPM series name.
  *
  * 编译期支持由 `HPMSOC_HAS_HPMSDK_SPI` 和 `__has_include("hpm_spi_drv.h")`
- * 同时 gate；缺少能力宏或裁剪 SDK 头时仍保留 LibXR API 形状，但配置和传输接口返回
- * `NOT_SUPPORT`，避免无 SPI SoC 或裁剪 SDK 的 glob 构建直接失败。
+ * 同时 gate；缺少能力宏或裁剪 SDK 头时不会声明 `HPMSPI` 类，避免无 SPI SoC 或裁剪
+ * SDK 的 glob 构建直接失败。
  * Compile-time support is gated by both `HPMSOC_HAS_HPMSDK_SPI` and
  * `__has_include("hpm_spi_drv.h")`. When the capability macro or trimmed SDK header
- * is missing, the LibXR API shape remains available but configuration and transfer
- * APIs return `NOT_SUPPORT`, avoiding direct glob-build failures on SoCs or trimmed
- * SDKs without SPI.
+ * is missing, the `HPMSPI` class is not declared, avoiding direct glob-build
+ * failures on SoCs or trimmed SDKs without SPI.
  *
   * `SetChipSelect()`, `SetDmaEnabled()`, `SetDmaEnableMinSize()`, `IsDmaEnabled()`,
   * `IsDmaSupported()`,
@@ -740,3 +741,5 @@ class HPMSPI final : public SPI
 };
 
 }  // namespace LibXR
+
+#endif
