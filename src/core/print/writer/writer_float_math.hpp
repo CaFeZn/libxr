@@ -4,6 +4,30 @@
  * @brief 通用浮点文本格式化器使用的数学辅助函数。 / Math helpers used by the generic float text formatter.
  */
 
+namespace Detail
+{
+template <typename Float>
+[[nodiscard]] Float NearbyInteger(Float value)
+{
+#if defined(__GNUC__) || defined(__clang__)
+  if constexpr (std::is_same_v<Float, float>)
+  {
+    return static_cast<Float>(__builtin_nearbyintf(value));
+  }
+  else if constexpr (std::is_same_v<Float, long double>)
+  {
+    return static_cast<Float>(__builtin_nearbyintl(value));
+  }
+  else
+  {
+    return static_cast<Float>(__builtin_nearbyint(value));
+  }
+#else
+  return static_cast<Float>(std::nearbyint(value));
+#endif
+}
+}  // namespace Detail
+
 /**
  * @brief 浮点文本输出归一化过程中使用的十进制缩放对 / Decimal-scale pair used while normalizing one float for text output.
  * @tparam Float Float type. / 浮点类型。
@@ -79,7 +103,7 @@ Float Writer::RoundDecimal(Float value, uint8_t precision)
     return value;
   }
 
-  return std::nearbyint(scaled) / scale;
+  return Detail::NearbyInteger(scaled) / scale;
 }
 
 template <typename Float>
@@ -92,7 +116,7 @@ Writer::ScientificDigits<Float> Writer::RoundScientificDigits(Float value,
   Float decimal_scale = Power10<Float>(result.exponent);
   Float mantissa = (value == 0) ? 0 : value / decimal_scale;
   result.scale = Power10<Float>(static_cast<int>(precision));
-  result.digits = std::nearbyint(mantissa * result.scale);
+  result.digits = Detail::NearbyInteger(mantissa * result.scale);
   if (result.digits >= static_cast<Float>(10) * result.scale)
   {
     result.digits /= 10;
