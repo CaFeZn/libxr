@@ -526,8 +526,46 @@ ErrorCode HPMSPI::EnsureDmaReady()
                                                : ConvertDmaStatus(status);
   }
 
+  ErrorCode fault_cb_ans = InstallDmaFaultCallbacks(hpm_spi_get_rx_dma_resource(spi_));
+  if (fault_cb_ans != ErrorCode::OK)
+  {
+    return fault_cb_ans;
+  }
+  fault_cb_ans = InstallDmaFaultCallbacks(hpm_spi_get_tx_dma_resource(spi_));
+  if (fault_cb_ans != ErrorCode::OK)
+  {
+    return fault_cb_ans;
+  }
+
   dma_ready_ = true;
   return ErrorCode::OK;
+}
+
+ErrorCode HPMSPI::InstallDmaFaultCallbacks(dma_resource_t* resource)
+{
+  if (resource == nullptr || resource->base == nullptr)
+  {
+    return ErrorCode::NOT_SUPPORT;
+  }
+
+  hpm_stat_t status =
+      dma_mgr_install_chn_error_callback(resource, &HPMSPI::OnDmaFaultCallback, this);
+  if (status != status_success)
+  {
+    return ConvertDmaStatus(status);
+  }
+
+  status =
+      dma_mgr_install_chn_abort_callback(resource, &HPMSPI::OnDmaFaultCallback, this);
+  if (status != status_success)
+  {
+    return ConvertDmaStatus(status);
+  }
+
+  status = dma_mgr_enable_chn_irq(resource, DMA_MGR_INTERRUPT_MASK_TC |
+                                                DMA_MGR_INTERRUPT_MASK_ERROR |
+                                                DMA_MGR_INTERRUPT_MASK_ABORT);
+  return ConvertDmaStatus(status);
 }
 
 void HPMSPI::ClearDmaContext()
@@ -538,6 +576,7 @@ void HPMSPI::ClearDmaContext()
   dma_ctx_.tx = nullptr;
   dma_ctx_.user_read = {nullptr, 0};
   dma_ctx_.size = 0U;
+  dma_ctx_.rx_copy_offset = 0U;
   dma_ctx_.copy_rx_to_user = false;
   dma_ctx_.switch_buffer_on_success = false;
   dma_ctx_.rx_done.store(0U, std::memory_order_release);
@@ -583,8 +622,9 @@ bool HPMSPI::TryClaimDmaCompletion()
 
 ErrorCode HPMSPI::StartDmaTransfer(uint8_t* rx, uint8_t* tx, uint32_t size,
                                    DmaTransferKind kind, RawData user_read,
-                                   bool copy_rx_to_user, bool switch_buffer_on_success,
-                                   OperationRW& op, bool in_isr)
+                                   bool copy_rx_to_user, uint32_t rx_copy_offset,
+                                   bool switch_buffer_on_success, OperationRW& op,
+                                   bool in_isr)
 {
   if (size == 0U)
   {
@@ -606,6 +646,17 @@ ErrorCode HPMSPI::StartDmaTransfer(uint8_t* rx, uint8_t* tx, uint32_t size,
   {
     return FinishOperation(op, in_isr, ErrorCode::PTR_NULL);
   }
+  if (copy_rx_to_user)
+  {
+    if (rx == nullptr || (user_read.size_ > 0U && user_read.addr_ == nullptr))
+    {
+      return FinishOperation(op, in_isr, ErrorCode::PTR_NULL);
+    }
+    if (rx_copy_offset > size || user_read.size_ > (size - rx_copy_offset))
+    {
+      return FinishOperation(op, in_isr, ErrorCode::SIZE_ERR);
+    }
+  }
 
   ErrorCode ans = EnsureDmaReady();
   if (ans != ErrorCode::OK)
@@ -621,6 +672,7 @@ ErrorCode HPMSPI::StartDmaTransfer(uint8_t* rx, uint8_t* tx, uint32_t size,
   dma_ctx_.tx = tx;
   dma_ctx_.user_read = user_read;
   dma_ctx_.size = size;
+  dma_ctx_.rx_copy_offset = rx_copy_offset;
   dma_ctx_.copy_rx_to_user = copy_rx_to_user;
   dma_ctx_.switch_buffer_on_success = switch_buffer_on_success;
   dma_completion_claim_.store(0U, std::memory_order_release);
@@ -745,6 +797,7 @@ ErrorCode HPMSPI::CompleteDmaTransfer(bool in_isr, ErrorCode ans, bool notify_bl
   uint8_t* rx = dma_ctx_.rx;
   const uint32_t size = dma_ctx_.size;
   const RawData user_read = dma_ctx_.user_read;
+  const uint32_t rx_copy_offset = dma_ctx_.rx_copy_offset;
   const bool copy_rx_to_user = dma_ctx_.copy_rx_to_user;
   const bool switch_buffer_on_success = dma_ctx_.switch_buffer_on_success;
   bool dma_stopped = false;
@@ -775,7 +828,7 @@ ErrorCode HPMSPI::CompleteDmaTransfer(bool in_isr, ErrorCode ans, bool notify_bl
   if (ans == ErrorCode::OK && copy_rx_to_user && user_read.addr_ != nullptr &&
       user_read.size_ > 0U)
   {
-    Memory::FastCopy(user_read.addr_, rx, user_read.size_);
+    Memory::FastCopy(user_read.addr_, rx + rx_copy_offset, user_read.size_);
   }
   if (ans == ErrorCode::OK && switch_buffer_on_success)
   {
@@ -830,6 +883,19 @@ void HPMSPI::OnTxDmaTcCallback(DMA_Type* base, uint32_t channel, void* cb_data_p
 
   self->dma_ctx_.tx_done.store(1U, std::memory_order_release);
   self->MaybeCompleteDmaTransfer(true);
+}
+
+void HPMSPI::OnDmaFaultCallback(DMA_Type* base, uint32_t channel, void* cb_data_ptr)
+{
+  UNUSED(base);
+  UNUSED(channel);
+  auto* self = static_cast<HPMSPI*>(cb_data_ptr);
+  if (self == nullptr || !self->DmaTransferActive())
+  {
+    return;
+  }
+
+  (void)self->CompleteDmaTransfer(true, ErrorCode::FAILED);
 }
 #endif
 
@@ -1015,7 +1081,7 @@ ErrorCode HPMSPI::ReadAndWrite(RawData read_data, ConstRawData write_data,
     return StartDmaTransfer((read_data.size_ > 0) ? rx_bytes : nullptr,
                             (write_data.size_ > 0) ? tx_bytes : nullptr,
                             static_cast<uint32_t>(need), kind, read_data,
-                            read_data.size_ > 0, true, op, in_isr);
+                            read_data.size_ > 0, 0U, true, op, in_isr);
   }
 #endif
 
@@ -1038,10 +1104,7 @@ ErrorCode HPMSPI::ReadAndWrite(RawData read_data, ConstRawData write_data,
     Memory::FastCopy(read_data.addr_, rx_bytes, read_data.size_);
   }
 
-  if (ans == ErrorCode::OK)
-  {
-    SwitchBuffer();
-  }
+  SwitchBuffer();
   return FinishOperation(op, in_isr, ans);
 }
 
@@ -1168,18 +1231,15 @@ ErrorCode HPMSPI::Transfer(size_t size, OperationRW& op, bool in_isr)
   {
     return StartDmaTransfer(static_cast<uint8_t*>(rx.addr_),
                             static_cast<uint8_t*>(tx.addr_), static_cast<uint32_t>(size),
-                            DmaTransferKind::WRITE_READ, RawData(nullptr, 0), false, true,
-                            op, in_isr);
+                            DmaTransferKind::WRITE_READ, RawData(nullptr, 0), false, 0U,
+                            true, op, in_isr);
   }
 #endif
 
   ErrorCode ans =
       DoTransfer(static_cast<uint8_t*>(rx.addr_), static_cast<const uint8_t*>(tx.addr_),
                  static_cast<uint32_t>(size));
-  if (ans == ErrorCode::OK)
-  {
-    SwitchBuffer();
-  }
+  SwitchBuffer();
   return FinishOperation(op, in_isr, ans);
 }
 
@@ -1192,11 +1252,7 @@ ErrorCode HPMSPI::MemRead(uint16_t reg, RawData read_data, OperationRW& op, bool
   }
 #endif
 
-  if (read_data.size_ == 0)
-  {
-    return FinishOperation(op, in_isr, ErrorCode::OK);
-  }
-  if (read_data.addr_ == nullptr)
+  if (read_data.size_ > 0 && read_data.addr_ == nullptr)
   {
     return FinishOperation(op, in_isr, ErrorCode::PTR_NULL);
   }
@@ -1224,19 +1280,25 @@ ErrorCode HPMSPI::MemRead(uint16_t reg, RawData read_data, OperationRW& op, bool
 
   auto* rx_bytes = static_cast<uint8_t*>(rx.addr_);
   auto* tx_bytes = static_cast<uint8_t*>(tx.addr_);
+  Memory::FastSet(tx_bytes, 0, total);
   tx_bytes[0] = static_cast<uint8_t>(reg | 0x80u);
-  Memory::FastSet(tx_bytes + 1, 0, read_data.size_);
+
+#if LIBXR_HPM_SPI_HAS_DMA_MGR
+  if (ShouldUseDma(total))
+  {
+    return StartDmaTransfer(rx_bytes, tx_bytes, static_cast<uint32_t>(total),
+                            DmaTransferKind::WRITE_READ, read_data,
+                            read_data.size_ > 0, 1U, true, op, in_isr);
+  }
+#endif
 
   ErrorCode ans = DoTransfer(rx_bytes, tx_bytes, static_cast<uint32_t>(total));
-  if (ans == ErrorCode::OK)
+  if (ans == ErrorCode::OK && read_data.size_ > 0)
   {
     Memory::FastCopy(read_data.addr_, rx_bytes + 1, read_data.size_);
   }
 
-  if (ans == ErrorCode::OK)
-  {
-    SwitchBuffer();
-  }
+  SwitchBuffer();
   return FinishOperation(op, in_isr, ans);
 }
 
@@ -1276,20 +1338,22 @@ ErrorCode HPMSPI::MemWrite(uint16_t reg, ConstRawData write_data, OperationRW& o
 
   auto* tx_bytes = static_cast<uint8_t*>(tx.addr_);
   tx_bytes[0] = static_cast<uint8_t>(reg & 0x7Fu);
-  if (write_data.size_ == 0 && tx.size_ > 1)
-  {
-    tx_bytes[1] = 0;
-  }
   if (write_data.size_ > 0)
   {
     Memory::FastCopy(tx_bytes + 1, write_data.addr_, write_data.size_);
   }
 
-  ErrorCode ans = DoWriteOnly(tx_bytes, static_cast<uint32_t>(total));
-  if (ans == ErrorCode::OK)
+#if LIBXR_HPM_SPI_HAS_DMA_MGR
+  if (ShouldUseDma(total))
   {
-    SwitchBuffer();
+    return StartDmaTransfer(nullptr, tx_bytes, static_cast<uint32_t>(total),
+                            DmaTransferKind::WRITE_ONLY, RawData(nullptr, 0), false, 0U,
+                            true, op, in_isr);
   }
+#endif
+
+  ErrorCode ans = DoWriteOnly(tx_bytes, static_cast<uint32_t>(total));
+  SwitchBuffer();
   return FinishOperation(op, in_isr, ans);
 }
 

@@ -47,6 +47,7 @@ using LibXRHpmSpiStatusType = hpm_stat_t;
 
 #if defined(USE_DMA_MGR) && (USE_DMA_MGR) && \
     __has_include("hpm_spi.h") && __has_include("hpm_dma_mgr.h")
+#include "hpm_dma_mgr.h"
 #include "hpm_spi.h"
 #define LIBXR_HPM_SPI_HAS_DMA_MGR 1
 #else
@@ -67,12 +68,12 @@ namespace LibXR
  *
   * 默认实现按传输长度自动选择 HPM SDK 阻塞式传输 API 或 SPI component DMA manager
   * nonblocking data-phase API；直到 DMA 回调完成前同一实例的其它事务会返回 BUSY。
-  * CommandRead()、CommandWriteRead()、MemRead() 和 MemWrite() 保持阻塞路径。
+  * CommandRead() 和 CommandWriteRead() 保持阻塞 command-phase 路径。
   * The default implementation automatically selects the HPM SDK blocking transfer
   * APIs or SPI component DMA-manager nonblocking data-phase APIs by transfer size,
   * and other transactions on the same instance return BUSY until the DMA callback
-  * completes. CommandRead(), CommandWriteRead(), MemRead(), and MemWrite() stay on
-  * the blocking path.
+  * completes. CommandRead() and CommandWriteRead() stay on the blocking command-phase
+  * path.
  *
   * 支持 LibXR 操作模式参数；小包同步完成，自动 DMA 选中的流式传输可后台完成 /
   * LibXR operation mode parameters are accepted; small transfers complete
@@ -258,13 +259,14 @@ class HPMSPI final : public SPI
    * Enable or disable the HPM SPI automatic DMA-manager path.
    *
    * DMA 路径仅在工程启用 `USE_DMA_MGR=1` 且 HPM SDK 提供 `hpm_spi.h`
-   * 组件 API 时可用。它只覆盖普通 data-phase 流式传输，即 ReadAndWrite() 和
-   * Transfer()；CommandRead() / CommandWriteRead() 仍使用 HPM SDK command phase
+   * 组件 API 时可用。它覆盖普通 data-phase 流式传输，即 ReadAndWrite()、Transfer()
+   * 和寄存器型 MemRead()/MemWrite()；CommandRead() / CommandWriteRead() 仍使用 HPM SDK command phase
    * 阻塞传输，以保持 SPI flash opcode-read 时序。
    *
    * The DMA path is available only when the project builds with `USE_DMA_MGR=1`
    * and the HPM SDK `hpm_spi.h` component APIs are present. It covers regular
-   * data-phase stream transfers through ReadAndWrite() and Transfer() only.
+   * data-phase stream transfers through ReadAndWrite(), Transfer(), and
+   * register-style MemRead()/MemWrite().
    * CommandRead() / CommandWriteRead() keep using the blocking HPM SDK command
    * phase so SPI-flash opcode-read timing remains unchanged.
    *
@@ -294,8 +296,8 @@ class HPMSPI final : public SPI
   /**
    * @brief 查询当前是否启用 DMA 流式传输 / Query whether DMA stream transfers are
    * enabled.
-   * @return true 表示 ReadAndWrite()/Transfer() 会优先使用 DMA /
-   * true when ReadAndWrite()/Transfer() prefer DMA.
+   * @return true 表示流式传输和寄存器型访问会优先使用 DMA /
+   * true when stream transfers and register-style accesses prefer DMA.
    */
   bool IsDmaEnabled() const { return dma_enabled_; }
 
@@ -395,19 +397,19 @@ class HPMSPI final : public SPI
    *
    * @param reg 寄存器地址；置读位前的有效范围为 0x00..0x7F /
    * Register address. Effective range before applying the read bit is 0x00..0x7F.
-   * @param read_data 目标载荷缓冲区；size_ 为 0 时不访问总线并返回 OK；非零长度时
-   * addr_ 必须非空 / Destination payload buffer. A zero-size buffer completes with OK
-   * without bus access; for non-zero size, addr_ must be non-null.
+   * @param read_data 目标载荷缓冲区；size_ 为 0 时仍发送寄存器命令字节；非零长度时
+   * addr_ 必须非空 / Destination payload buffer. A zero-size buffer still sends the
+   * register command byte; for non-zero size, addr_ must be non-null.
    * @param op LibXR 读写操作描述符，见类注释中的操作模式说明 /
    * LibXR read/write operation descriptor. See class-level operation mode notes.
    * @param in_isr 仅用于 CALLBACK/POLLING 完成分发的中断上下文标志 /
    * ISR-context flag forwarded only to CALLBACK/POLLING completion handling.
-   * @return 成功返回 OK；空目标缓冲区返回 PTR_NULL；寄存器地址超过 0x7F 返回
+   * @return 成功返回 OK；非零长度空目标缓冲区返回 PTR_NULL；寄存器地址超过 0x7F 返回
    * OUT_OF_RANGE；命令字节加载荷超过硬件限制或暂存缓冲区容量返回 SIZE_ERR；其余返回
-   * HPM SDK 状态转换后的错误码 / Returns OK on success, PTR_NULL for null non-empty
-   * destination, OUT_OF_RANGE for register addresses above 0x7F, SIZE_ERR when command
-   * byte plus payload exceeds hardware limit or staging capacity, or converted HPM SDK
-   * status otherwise.
+   * HPM SDK 状态转换后的错误码 / Returns OK on success, PTR_NULL for a null non-empty
+   * destination, OUT_OF_RANGE for register addresses above 0x7F, SIZE_ERR when
+   * command byte plus payload exceeds hardware limit or staging capacity, or converted
+   * HPM SDK status otherwise.
    * @note 该接口保留给“bit7 表示读写”的寄存器型 SPI 设备；它不是通用 SPI flash
    * opcode-read API。读取 W25Q128 `0x9F` 这类命令应优先使用 CommandRead()。
    * This method is kept for register-style SPI devices where bit 7 marks read/write.
@@ -634,6 +636,7 @@ class HPMSPI final : public SPI
     uint8_t* tx = nullptr;
     RawData user_read = {nullptr, 0};
     uint32_t size = 0;
+    uint32_t rx_copy_offset = 0;
     bool copy_rx_to_user = false;
     bool switch_buffer_on_success = false;
     std::atomic<uint32_t> rx_done{0U};
@@ -665,8 +668,14 @@ class HPMSPI final : public SPI
    */
   ErrorCode StartDmaTransfer(uint8_t* rx, uint8_t* tx, uint32_t size,
                              DmaTransferKind kind, RawData user_read,
-                             bool copy_rx_to_user, bool switch_buffer_on_success,
-                             OperationRW& op, bool in_isr);
+                             bool copy_rx_to_user, uint32_t rx_copy_offset,
+                             bool switch_buffer_on_success, OperationRW& op,
+                             bool in_isr);
+
+  /**
+   * @brief 安装 DMA error/abort 回调 / Install DMA error/abort callbacks.
+   */
+  ErrorCode InstallDmaFaultCallbacks(dma_resource_t* resource);
 
   /**
    * @brief 停止当前 DMA 请求和通道 / Stop current DMA requests and channels.
@@ -714,6 +723,11 @@ class HPMSPI final : public SPI
    * @brief TX DMA terminal-count callback / TX DMA 终端计数回调。
    */
   static void OnTxDmaTcCallback(DMA_Type* base, uint32_t channel, void* cb_data_ptr);
+
+  /**
+   * @brief DMA error/abort callback / DMA 错误或中止回调。
+   */
+  static void OnDmaFaultCallback(DMA_Type* base, uint32_t channel, void* cb_data_ptr);
 #endif
 
   LibXRHpmSpiType* spi_;           ///< SPI 外设实例 / SPI peripheral instance.
