@@ -53,3 +53,11 @@ size_t DoubleBuffer::GetPendingLength() const
 {
   return pending_valid_ ? pending_len_ : 0;
 }
+
+void DoubleBuffer::Reset()
+{
+  active_ = 0;
+  pending_valid_ = false;
+  active_len_ = 0;
+  pending_len_ = 0;
+}

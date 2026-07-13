@@ -12,13 +12,15 @@
 using namespace LibXR;
 
 HPMSPI::HPMSPI(SPI_Type* spi, clock_name_t clock, RawData rx_buffer, RawData tx_buffer,
-               bool auto_board_init, SPI::Configuration config)
+               bool auto_board_init, SPI::Configuration config,
+               ChipSelectControl chip_select)
     : SPI(rx_buffer, tx_buffer),
       spi_(spi),
       clock_(clock),
       rx_buffer_capacity_(rx_buffer.size_),
       tx_buffer_capacity_(tx_buffer.size_),
-      auto_board_init_(auto_board_init)
+      auto_board_init_(auto_board_init),
+      chip_select_(chip_select)
 {
   ASSERT(spi_ != nullptr);
   ASSERT(rx_buffer.addr_ != nullptr);
@@ -261,6 +263,14 @@ uint32_t HPMSPI::GetMaxBusSpeed() const { return source_clock_hz_; }
 
 SPI::Prescaler HPMSPI::GetMaxPrescaler() const { return Prescaler::DIV_256; }
 
+void HPMSPI::SetChipSelect(bool selected) const
+{
+  if (chip_select_ != nullptr)
+  {
+    chip_select_(selected);
+  }
+}
+
 ErrorCode HPMSPI::DoTransfer(uint8_t* rx, const uint8_t* tx, uint32_t size)
 {
   if (size == 0)
@@ -277,8 +287,10 @@ ErrorCode HPMSPI::DoTransfer(uint8_t* rx, const uint8_t* tx, uint32_t size)
   }
 
   spi_control_config_t control = MakeControlConfig(spi_trans_write_read_together);
+  SetChipSelect(true);
   const hpm_stat_t status = spi_transfer(spi_, &control, nullptr, nullptr,
                                          const_cast<uint8_t*>(tx), size, rx, size);
+  SetChipSelect(false);
   if (ShouldRecover(status))
   {
     RecoverController();
@@ -302,8 +314,10 @@ ErrorCode HPMSPI::DoWriteOnly(const uint8_t* tx, uint32_t size)
   }
 
   spi_control_config_t control = MakeControlConfig(spi_trans_write_only);
+  SetChipSelect(true);
   const hpm_stat_t status = spi_transfer(spi_, &control, nullptr, nullptr,
                                          const_cast<uint8_t*>(tx), size, nullptr, 1);
+  SetChipSelect(false);
   if (ShouldRecover(status))
   {
     RecoverController();
@@ -327,8 +341,10 @@ ErrorCode HPMSPI::DoReadOnly(uint8_t* rx, uint32_t size)
   }
 
   spi_control_config_t control = MakeControlConfig(spi_trans_read_only);
+  SetChipSelect(true);
   const hpm_stat_t status =
       spi_transfer(spi_, &control, nullptr, nullptr, nullptr, 1, rx, size);
+  SetChipSelect(false);
   if (ShouldRecover(status))
   {
     RecoverController();

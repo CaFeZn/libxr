@@ -2,6 +2,7 @@
 #include <cstring>
 #include <vector>
 
+#include "../driver/hpm/hpm_uart_tx_queue.hpp"
 #include "libxr.hpp"
 #include "libxr_def.hpp"
 #include "libxr_pipe.hpp"
@@ -823,6 +824,46 @@ void test_rw_write_port_block_reused_waiter_discards_stale_signal()
   ASSERT(sem.Value() == 0);
 }
 
+void test_hpm_uart_dma_failure_clears_staged_and_queued_writes()
+{
+  using namespace LibXR;
+
+  WritePort write(3, 24);
+  write = PendingWriteFun;
+
+  uint8_t dma_storage[16] = {};
+  DoubleBuffer dma_buffer(RawData{dma_storage, sizeof(dma_storage)});
+  static const uint8_t STAGED[] = {0x11, 0x12, 0x13};
+  static const uint8_t QUEUED[] = {0x21, 0x22, 0x23, 0x24};
+
+  WriteHarness staged(TestMode::POLLING);
+  WriteHarness queued(TestMode::POLLING);
+  ASSERT(write(ConstRawData{STAGED, sizeof(STAGED)}, staged.op) == ErrorCode::OK);
+  ASSERT(write(ConstRawData{QUEUED, sizeof(QUEUED)}, queued.op) == ErrorCode::OK);
+  staged.ExpectPendingSubmitted();
+  queued.ExpectPendingSubmitted();
+
+  ASSERT(write.queue_data_->PopBatch(dma_buffer.PendingBuffer(), sizeof(STAGED)) ==
+         ErrorCode::OK);
+  dma_buffer.SetPendingLength(sizeof(STAGED));
+  dma_buffer.EnablePending();
+
+  HPMUARTDetail::FailAndClearPendingWrites(write, dma_buffer, ErrorCode::FAILED, true);
+
+  staged.ExpectFinal(ErrorCode::FAILED);
+  queued.ExpectFinal(ErrorCode::FAILED);
+  ASSERT(write.Size() == 0);
+  ASSERT(write.queue_info_->Size() == 0);
+  ASSERT(!dma_buffer.HasPending());
+
+  static const uint8_t RECOVERED[] = {0x31, 0x32};
+  WriteHarness recovered(TestMode::POLLING);
+  ASSERT(write(ConstRawData{RECOVERED, sizeof(RECOVERED)}, recovered.op) ==
+         ErrorCode::OK);
+  recovered.ExpectPendingSubmitted();
+  HPMUARTDetail::FailAndClearPendingWrites(write, dma_buffer, ErrorCode::FAILED, false);
+}
+
 void test_rw()
 {
   test_rw_pending_mode_matrix();
@@ -839,4 +880,5 @@ void test_rw()
   test_rw_read_port_block_pending_result_propagates();
   test_rw_write_port_block_pending_result_propagates();
   test_rw_write_port_block_reused_waiter_discards_stale_signal();
+  test_hpm_uart_dma_failure_clears_staged_and_queued_writes();
 }

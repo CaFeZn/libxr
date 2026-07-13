@@ -139,6 +139,9 @@ class DoubleBuffer
    */
   void SetActiveBlock(bool block) { active_ = block ? 1 : 0; }
 
+  /** @brief Clear active and pending state without modifying the backing storage. */
+  void Reset();
+
  private:
   uint8_t* buffer_[2];  ///< 双缓冲区指针 / Double buffer pointers
   const size_t SIZE;    ///< 单个缓冲区大小 / Size of each buffer

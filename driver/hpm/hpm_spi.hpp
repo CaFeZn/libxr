@@ -38,6 +38,8 @@ namespace LibXR
 class HPMSPI final : public SPI
 {
  public:
+  using ChipSelectControl = void (*)(bool selected);
+
   /**
    * @brief 构造 HPM SPI 主机对象 / Construct an HPM SPI master object.
    * @param spi HPM SPI 外设基地址，不能为空 /
@@ -60,6 +62,8 @@ class HPMSPI final : public SPI
    * Initial SPI configuration. This driver configures hardware as 8-bit,
    * MSB-first, single-I/O master. The current HPM backend supports DIV_1 and
    * even prescalers up to DIV_256.
+   * @param chip_select Optional GPIO chip-select callback. It is called with true
+   * immediately before a transfer and false immediately after it.
    *
    * @note 构造函数会断言外设指针为空、暂存缓冲区为空、源时钟无法解析或初始配置无效 /
    * The constructor asserts on null peripheral pointer, null/empty staging buffers,
@@ -68,7 +72,8 @@ class HPMSPI final : public SPI
   HPMSPI(SPI_Type* spi, clock_name_t clock, RawData rx_buffer, RawData tx_buffer,
          bool auto_board_init = true,
          SPI::Configuration config = {SPI::ClockPolarity::LOW, SPI::ClockPhase::EDGE_1,
-                                      SPI::Prescaler::DIV_4, false});
+                                      SPI::Prescaler::DIV_4, false},
+         ChipSelectControl chip_select = nullptr);
 
   /**
    * @brief 传输 SPI 字节，并可同时采集接收数据 /
@@ -301,6 +306,8 @@ class HPMSPI final : public SPI
    */
   ErrorCode DoReadOnly(uint8_t* rx, uint32_t size);
 
+  void SetChipSelect(bool selected) const;
+
   SPI_Type* spi_;                  ///< SPI 外设实例 / SPI peripheral instance.
   clock_name_t clock_;             ///< SPI 源时钟名称 / SPI source clock name.
   uint32_t source_clock_hz_ = 0;   ///< 缓存的源时钟频率 / Cached source clock frequency.
@@ -308,6 +315,7 @@ class HPMSPI final : public SPI
   size_t tx_buffer_capacity_ = 0;  ///< 原始 TX 缓冲区容量 / Raw TX buffer capacity.
   bool configured_ = false;        ///< 是否已有成功配置 / Whether a config was applied.
   bool auto_board_init_;  ///< 是否自动调用板级初始化 / Whether board init is automatic.
+  ChipSelectControl chip_select_;  ///< Optional transaction-level GPIO chip-select.
 };
 
 }  // namespace LibXR

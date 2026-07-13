@@ -42,4 +42,15 @@ void test_double_buffer()
 
   // 6. 不合法长度填充
   ASSERT(buffer.FillPending(test_data, 80) == false);  // 超过单 buffer 长度
+
+  // 7. Reset clears transfer state and restores the first active block.
+  buffer.SetActiveBlock(true);
+  buffer.SetActiveLength(12);
+  buffer.SetPendingLength(8);
+  buffer.EnablePending();
+  buffer.Reset();
+  ASSERT(buffer.ActiveBuffer() == buff);
+  ASSERT(buffer.GetActiveLength() == 0);
+  ASSERT(buffer.GetPendingLength() == 0);
+  ASSERT(buffer.HasPending() == false);
 }
