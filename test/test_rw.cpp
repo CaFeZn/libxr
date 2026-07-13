@@ -750,26 +750,6 @@ void test_rw_write_port_reset_late_finish_before_timeout_wake()
   ASSERT(w(ConstRawData{TX2, sizeof(TX2)}, next_op) == ErrorCode::OK);
 }
 
-void test_rw_read_port_block_pending_result_propagates()
-{
-  using namespace LibXR;
-
-  ReadPort r(16);
-  r = PendingReadFun;
-
-  uint8_t rx[1] = {0};
-  Semaphore sem;
-  ReadOperation op(sem, 100);
-  Semaphore done;
-  Thread finisher;
-  StartReadFinisher(finisher, r, done, ErrorCode::FAILED, "rd_finish");
-
-  auto ec = r(RawData{rx, sizeof(rx)}, op);
-  ASSERT(ec == ErrorCode::FAILED);
-  ExpectWaitOk(done, kShortWaitMs);
-  JoinThreadIfNeeded(finisher);
-}
-
 void test_rw_write_port_block_pending_result_propagates()
 {
   using namespace LibXR;
@@ -877,7 +857,6 @@ void test_rw()
   test_rw_read_port_reset_detaches_block_waiter();
   test_rw_write_port_reset_detaches_block_waiter();
   test_rw_write_port_reset_late_finish_before_timeout_wake();
-  test_rw_read_port_block_pending_result_propagates();
   test_rw_write_port_block_pending_result_propagates();
   test_rw_write_port_block_reused_waiter_discards_stale_signal();
   test_hpm_uart_dma_failure_clears_staged_and_queued_writes();

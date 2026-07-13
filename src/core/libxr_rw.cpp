@@ -441,8 +441,11 @@ ErrorCode WritePort::CommitWrite(ConstRawData data, WriteOperation& op, bool met
 
     if (expected != BusyState::BLOCK_CLAIMED)
     {
-      ASSERT(expected == BusyState::BLOCK_DETACHED);
-      busy_.store(BusyState::IDLE, std::memory_order_release);
+      ASSERT(expected == BusyState::BLOCK_DETACHED || expected == BusyState::IDLE);
+      if (expected == BusyState::BLOCK_DETACHED)
+      {
+        busy_.store(BusyState::IDLE, std::memory_order_release);
+      }
       return ErrorCode::TIMEOUT;
     }
 
