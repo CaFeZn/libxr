@@ -1,5 +1,8 @@
 #include "stm32_adc.hpp"
 
+#include <cstddef>
+#include <limits>
+
 #include "libxr_def.hpp"
 #include "stm32_dcache.hpp"
 
@@ -20,6 +23,21 @@ extern "C" HAL_StatusTypeDef
 }
 #endif
 
+namespace
+{
+
+uint8_t CalculateFilterSize(RawData dma_buff, std::size_t channel_count)
+{
+  ASSERT(channel_count > 0U);
+
+  const std::size_t filter_size = dma_buff.size_ / channel_count / sizeof(uint16_t);
+  ASSERT(filter_size > 0U);
+  ASSERT(filter_size <= std::numeric_limits<uint8_t>::max());
+  return static_cast<uint8_t>(filter_size);
+}
+
+}  // namespace
+
 STM32ADC::Channel::Channel(STM32ADC* adc, uint8_t index, uint32_t ch)
     : adc_(adc), index_(index), ch_(ch)
 {
@@ -31,7 +49,7 @@ STM32ADC::STM32ADC(ADC_HandleTypeDef* hadc, RawData dma_buff,
                    std::initializer_list<uint32_t> channels, float vref)
     : hadc_(hadc),
       NUM_CHANNELS(channels.size()),
-      filter_size_(dma_buff.size_ / NUM_CHANNELS / 2),
+      filter_size_(CalculateFilterSize(dma_buff, channels.size())),
       use_dma_(hadc_->DMA_Handle != nullptr),
       dma_buffer_(dma_buff),
       resolution_(GetADCResolution<ADC_HandleTypeDef>{}.Get(hadc)),
@@ -61,10 +79,19 @@ STM32ADC::STM32ADC(ADC_HandleTypeDef* hadc, RawData dma_buff,
     /* DMA must be in circular mode */
     AssertContinuousConvModeEnabled<H>(hadc_);
     AssertDMAContReqEnabled<H>(hadc_);
+#if !defined(LIBXR_STM32_ADC_GPDMA)
     AssertDMACircular<H>(hadc_);
+#endif
     AssertNbrOfConvEq<H>(hadc_, NUM_CHANNELS);
+#if defined(LIBXR_STM32_ADC_GPDMA)
+    [[maybe_unused]] const auto adc_dma_result =
+        gpdma_adapter_.Start(hadc_, reinterpret_cast<uint32_t*>(dma_buffer_.addr_),
+                             NUM_CHANNELS * filter_size_, dma_buffer_.size_);
+    REQUIRE(adc_dma_result == HAL_OK);
+#else
     HAL_ADC_Start_DMA(hadc_, reinterpret_cast<uint32_t*>(dma_buffer_.addr_),
                       NUM_CHANNELS * filter_size_);
+#endif
   }
   else
   {
@@ -76,7 +103,19 @@ STM32ADC::STM32ADC(ADC_HandleTypeDef* hadc, RawData dma_buff,
 
 STM32ADC::~STM32ADC()
 {
+#if defined(LIBXR_STM32_ADC_GPDMA)
+  if (use_dma_)
+  {
+    [[maybe_unused]] const auto adc_dma_result = gpdma_adapter_.Stop(hadc_);
+    REQUIRE(adc_dma_result == HAL_OK);
+  }
+  else
+  {
+    HAL_ADC_Stop(hadc_);
+  }
+#else
   use_dma_ ? HAL_ADC_Stop_DMA(hadc_) : HAL_ADC_Stop(hadc_);
+#endif
   for (uint8_t i = 0; i < NUM_CHANNELS; ++i)
   {
     delete channels_[i];

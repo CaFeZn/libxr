@@ -51,7 +51,7 @@ See [XRUSB](https://github.com/Jiu-xiao/XRUSB)
 
 ## Data structure
 
-| `Structure` | List | Stack | RBTree | LockFreeQueue | LockFreeList |
+| `Structure` | List | Stack | RBTree | Queue | LockFreeList |
 | ----------- | ---- | ----- | ------ | ------------- | ------------ |
 |             | ✅    | ✅     | ✅      | ✅             | ✅            |
 
@@ -121,14 +121,17 @@ set(LIBXR_DRIVER Linux)
 
 ### Build as Shared/Static Library
 
-By default, the library is built as an object target. You can explicitly set the build type in the CMake command line or your own CMakeLists.txt:
+By default, the library is built as a static target. You can explicitly set the build type in the CMake command line or your own CMakeLists.txt:
 
 ```cmake
 # Build as a shared library
 set(LIBXR_SHARED_BUILD True)
 
-# Build as a static library
+# Build as a static library (default)
 set(LIBXR_STATIC_BUILD True)
+
+# Build as an object library
+set(LIBXR_OBJECT_BUILD True)
 ```
 
 ### Disable Eigen
@@ -145,14 +148,6 @@ The default scalar type is `double`. This option only affects the default value 
 
 ```cmake
 set(LIBXR_DEFAULT_SCALAR float)
-```
-
-### Internal Printf Buffer Size
-
-Defaults to 128 for bare-metal/RTOS platforms, and 1024 for Linux. This option sets the buffer size for the `LibXR::STDIO::Printf` function. Setting this to 0 will disable all log printing.
-
-```cmake
-set(LIBXR_PRINTF_BUFFER_SIZE 256)
 ```
 
 ### Maximum Log Message Length
@@ -182,6 +177,19 @@ Enable this option to build unit tests on the Linux platform.
 ```cmake
 set(LIBXR_TEST_BUILD True)
 ```
+
+Automatic tests mirror source directories and file ownership in `test/automatic/`. Build and run the
+complete suite from the repository root:
+
+```sh
+cmake -S . -B build -DLIBXR_TEST_BUILD=ON -DLIBXR_DEV_ASSERT_BUILD=ON -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --parallel 8
+ctest --test-dir build --output-on-failure --no-tests=error
+```
+
+CTest provides the pseudo-terminal required by the runtime runner through the
+util-linux `script` program. See [test/README.md](test/README.md) for the build
+matrix, compile probes, and reserved manual-test directories.
 
 ## Others
 

@@ -1,10 +1,9 @@
 #pragma once
 
-#include "esp_def.hpp"
-
 #include <cstdint>
 
 #include "dac.hpp"
+#include "esp_def.hpp"
 #include "soc/soc_caps.h"
 
 #if SOC_DAC_SUPPORTED
@@ -41,7 +40,6 @@ class ESP32DAC : public DAC
 #endif
   }
 
-
   ErrorCode Write(float voltage) override
   {
 #if SOC_DAC_SUPPORTED
@@ -59,12 +57,12 @@ class ESP32DAC : public DAC
       voltage = reference_voltage_;
     }
 
-    constexpr uint32_t kMaxCode = (1U << SOC_DAC_RESOLUTION) - 1U;
-    const float scale = static_cast<float>(kMaxCode) / reference_voltage_;
+    constexpr uint32_t MAX_CODE = (1U << SOC_DAC_RESOLUTION) - 1U;
+    const float scale = static_cast<float>(MAX_CODE) / reference_voltage_;
     uint32_t code = static_cast<uint32_t>((voltage * scale) + 0.5f);
-    if (code > kMaxCode)
+    if (code > MAX_CODE)
     {
-      code = kMaxCode;
+      code = MAX_CODE;
     }
 
     dac_ll_update_output_value(ToChannel(channel_id_), static_cast<uint8_t>(code));

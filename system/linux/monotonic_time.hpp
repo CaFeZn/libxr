@@ -4,10 +4,17 @@
 
 #include <cstdint>
 
+extern struct timespec libxr_linux_start_time_spec;
+
 namespace LibXR
 {
 namespace MonotonicTime
 {
+inline uint64_t SpecMicroseconds(const timespec& ts)
+{
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL +
+         static_cast<uint64_t>(ts.tv_nsec) / 1000ULL;
+}
 
 inline timespec NowSpec()
 {
@@ -16,11 +23,20 @@ inline timespec NowSpec()
   return ts;
 }
 
-inline uint64_t NowMilliseconds()
+inline uint64_t NowMicroseconds() { return SpecMicroseconds(NowSpec()); }
+
+inline uint64_t NowMilliseconds() { return NowMicroseconds() / 1000ULL; }
+
+inline uint64_t XrToSharedMicroseconds(uint64_t timestamp_us)
 {
-  const timespec ts = NowSpec();
-  return static_cast<uint64_t>(ts.tv_sec) * 1000ULL +
-         static_cast<uint64_t>(ts.tv_nsec) / 1000000ULL;
+  const uint64_t start_us = SpecMicroseconds(libxr_linux_start_time_spec);
+  return UINT64_MAX - start_us < timestamp_us ? UINT64_MAX : start_us + timestamp_us;
+}
+
+inline uint64_t SharedToXrMicroseconds(uint64_t timestamp_us)
+{
+  const uint64_t start_us = SpecMicroseconds(libxr_linux_start_time_spec);
+  return timestamp_us >= start_us ? timestamp_us - start_us : 0;
 }
 
 inline timespec RelativeFromMilliseconds(uint32_t milliseconds)
@@ -60,10 +76,7 @@ inline int64_t ElapsedMicroseconds(const timespec& start)
          static_cast<int64_t>(now.tv_nsec - start.tv_nsec) / 1000LL;
 }
 
-inline uint32_t WaitSliceMilliseconds(uint32_t remaining_ms)
-{
-  return remaining_ms;
-}
+inline uint32_t WaitSliceMilliseconds(uint32_t remaining_ms) { return remaining_ms; }
 
 }  // namespace MonotonicTime
 }  // namespace LibXR

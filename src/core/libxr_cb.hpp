@@ -16,8 +16,7 @@ namespace LibXR
  * @brief Callable convertible to the exact callback function pointer
  */
 template <typename CallableType, typename BoundArgType, typename... CallbackArgs>
-concept CallbackFunctionCompatible = requires(CallableType callable)
-{
+concept CallbackFunctionCompatible = requires(CallableType callable) {
   static_cast<void (*)(bool, BoundArgType, CallbackArgs...)>(callable);
 };
 
@@ -55,6 +54,7 @@ class CallbackBlock : public CallbackBlockHeader<Args...>
   CallbackBlock(FunctionType fun, ArgType&& arg)
       : CallbackBlockHeader<Args...>{&InvokeThunk}, fun_(fun), arg_(std::move(arg))
   {
+    ASSERT(fun_ != nullptr);
   }
 
   /**
@@ -72,10 +72,6 @@ class CallbackBlock : public CallbackBlockHeader<Args...>
  protected:
   void Invoke(bool in_isr, Args... args)
   {
-    if (!fun_)
-    {
-      return;
-    }
     fun_(in_isr, arg_, std::forward<Args>(args)...);
   }
 
@@ -89,6 +85,11 @@ class GuardedCallbackBlock : public CallbackBlock<ArgType, Args...>
  public:
   /**
    * @brief 带防重入保护的回调块 / Callback block with reentry guard
+   *
+   * @note 该保护层只负责压平同一回调的递归重入链路，
+   *       不承担通用的跨上下文同步语义。
+   *       This guard only flattens self-recursive callback chains and does not
+   *       provide general cross-context synchronization semantics.
    */
   GuardedCallbackBlock(typename CallbackBlock<ArgType, Args...>::FunctionType fun,
                        ArgType&& arg)
@@ -111,7 +112,7 @@ class GuardedCallbackBlock : public CallbackBlock<ArgType, Args...>
         std::apply([&](auto&... a) { cb->Invoke(in_isr, a...); }, cur_args);
         if (cb->pending_)
         {
-          cur_args = cb->pending_args_;
+          cur_args = std::move(cb->pending_args_);
         }
       } while (cb->pending_);
       cb->running_ = false;
@@ -153,15 +154,20 @@ class Callback
    * @param fun 需要绑定的回调函数 / Callback function to bind
    * @param arg 绑定的参数值 / Bound argument value
    * @return Callback 实例 / Created Callback instance
+   *
+   * @note 预期用法是初始化阶段创建并长期持有；
+   *       运行时高频创建/销毁不属于设计目标。
+   *       Intended usage is initialization-time creation with long-lived
+   *       retention; runtime churn-style create/destroy patterns are outside
+   *       the intended model.
    */
   template <typename BoundArgType, typename CallableType>
-  requires CallbackFunctionCompatible<CallableType, BoundArgType, Args...>
+    requires CallbackFunctionCompatible<CallableType, BoundArgType, Args...>
   [[nodiscard]] static Callback Create(CallableType fun, BoundArgType arg)
   {
     using FunctionType = typename CallbackBlock<BoundArgType, Args...>::FunctionType;
-    auto cb_block =
-        new CallbackBlock<BoundArgType, Args...>(static_cast<FunctionType>(fun),
-                                                 std::move(arg));
+    auto cb_block = new CallbackBlock<BoundArgType, Args...>(
+        static_cast<FunctionType>(fun), std::move(arg));
     return Callback(cb_block);
   }
 
@@ -173,15 +179,19 @@ class Callback
    * @param fun 需要绑定的回调函数 / Callback function to bind
    * @param arg 绑定的参数值 / Bound argument value
    * @return Callback 实例 / Created Callback instance
+   *
+   * @note 该 guarded callback 预期用于单条逻辑回调链上的递归压平，
+   *       不承担任意多上下文串行化。
+   *       Guarded callbacks are meant for self-recursive flattening on one
+   *       logical callback chain, not arbitrary multi-context serialization.
    */
   template <typename BoundArgType, typename CallableType>
-  requires CallbackFunctionCompatible<CallableType, BoundArgType, Args...>
+    requires CallbackFunctionCompatible<CallableType, BoundArgType, Args...>
   [[nodiscard]] static Callback CreateGuarded(CallableType fun, BoundArgType arg)
   {
     using FunctionType = typename CallbackBlock<BoundArgType, Args...>::FunctionType;
-    auto cb_block =
-        new GuardedCallbackBlock<BoundArgType, Args...>(static_cast<FunctionType>(fun),
-                                                        std::move(arg));
+    auto cb_block = new GuardedCallbackBlock<BoundArgType, Args...>(
+        static_cast<FunctionType>(fun), std::move(arg));
     return Callback(cb_block);
   }
 

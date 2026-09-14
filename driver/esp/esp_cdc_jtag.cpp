@@ -5,62 +5,54 @@
      (defined(CONFIG_IDF_TARGET_ESP32C6) && CONFIG_IDF_TARGET_ESP32C6))
 
 #include <algorithm>
-#include <cstring>
-#include <new>
 
-#include "esp_attr.h"
 #include "hal/usb_serial_jtag_ll.h"
 #include "soc/interrupts.h"
 
 namespace
 {
-constexpr uint32_t kTxIntrMask = USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY;
-constexpr uint32_t kRxIntrMask = USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT;
-constexpr uint32_t kAllIntrMask = kTxIntrMask | kRxIntrMask;
+constexpr uint32_t TX_INTR_MASK = USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY;
+constexpr uint32_t RX_INTR_MASK = USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT;
+constexpr uint32_t ALL_INTR_MASK = TX_INTR_MASK | RX_INTR_MASK;
+constexpr size_t ENDPOINT_SIZE = 64U;
+
+constexpr bool IsConfigSupported(const LibXR::UART::Configuration& config)
+{
+  return (config.data_bits == 8U) && (config.stop_bits == 1U) &&
+         (config.parity == LibXR::UART::Parity::NO_PARITY);
+}
 }  // namespace
 
 namespace LibXR
 {
 
+void ESP32CDCJtagReadPort::OnReadQueueSpaceAvailable(bool in_isr)
+{
+  owner_.ResumeRx(in_isr);
+}
+
 ESP32CDCJtag::ESP32CDCJtag(size_t rx_buffer_size, size_t tx_buffer_size,
                            uint32_t tx_queue_size, UART::Configuration config)
     : UART(&_read_port, &_write_port),
-      config_(config),
-      tx_slot_storage_(new (std::nothrow) uint8_t[tx_buffer_size * 2U]),
-      tx_slot_size_(tx_buffer_size),
-      _read_port(rx_buffer_size),
+      _read_port(rx_buffer_size, *this),
       _write_port(tx_queue_size, tx_buffer_size)
 {
-  ASSERT(tx_slot_storage_ != nullptr);
-  ASSERT(tx_slot_size_ > 0U);
+  ASSERT(rx_buffer_size > 0U);
+  ASSERT(tx_buffer_size > 0U);
+  ASSERT(tx_queue_size > 0U);
 
-  tx_slot_a_ = tx_slot_storage_;
-  tx_slot_b_ = tx_slot_storage_ + tx_slot_size_;
+  INIT_CRIT_SECTION_LOCK_RUNTIME(&irq_lock_);
 
-  _read_port = ReadFun;
+  ASSERT(IsConfigSupported(config));
+  [[maybe_unused]] const auto init_hardware_result = InitHardware();
+  REQUIRE(init_hardware_result == ErrorCode::OK);
+
   _write_port = WriteFun;
-
-  if (SetConfig(config_) != ErrorCode::OK)
-  {
-    ASSERT(false);
-    return;
-  }
-
-  if (InitHardware() != ErrorCode::OK)
-  {
-    ASSERT(false);
-  }
 }
 
-ErrorCode ESP32CDCJtag::SetConfig(UART::Configuration config)
+ErrorCode ESP32CDCJtag::SetConfig(UART::Configuration config, bool)
 {
-  if ((config.data_bits != 8) || (config.stop_bits != 1) ||
-      (config.parity != UART::Parity::NO_PARITY))
-  {
-    return ErrorCode::ARG_ERR;
-  }
-  config_ = config;
-  return ErrorCode::OK;
+  return IsConfigSupported(config) ? ErrorCode::OK : ErrorCode::ARG_ERR;
 }
 
 ErrorCode ESP32CDCJtag::InitHardware()
@@ -70,25 +62,22 @@ ErrorCode ESP32CDCJtag::InitHardware()
     return ErrorCode::OK;
   }
 
-  ResetTxState(false);
-
-  const esp_err_t intr_ans = esp_intr_alloc(
-      ETS_USB_SERIAL_JTAG_INTR_SOURCE, ESP_INTR_FLAG_IRAM, IsrEntry, this, &intr_handle_);
-  intr_installed_ = (intr_ans == ESP_OK);
-  if (!intr_installed_)
+  const esp_err_t intr_ans =
+      esp_intr_alloc(ETS_USB_SERIAL_JTAG_INTR_SOURCE, 0, IsrEntry, this, &intr_handle_);
+  if (intr_ans != ESP_OK)
   {
     intr_handle_ = nullptr;
     return ErrorCode::INIT_ERR;
   }
 
-  usb_serial_jtag_ll_clr_intsts_mask(kAllIntrMask);
-  usb_serial_jtag_ll_ena_intr_mask(kRxIntrMask);
+  DisableAndClearInterrupt(ALL_INTR_MASK);
+  EnableInterrupt(RX_INTR_MASK);
 
   hw_inited_ = true;
   return ErrorCode::OK;
 }
 
-void IRAM_ATTR ESP32CDCJtag::IsrEntry(void* arg)
+void ESP32CDCJtag::IsrEntry(void* arg)
 {
   auto* cdc = static_cast<ESP32CDCJtag*>(arg);
   if (cdc != nullptr)
@@ -97,333 +86,264 @@ void IRAM_ATTR ESP32CDCJtag::IsrEntry(void* arg)
   }
 }
 
-ErrorCode IRAM_ATTR ESP32CDCJtag::WriteFun(WritePort& port, bool in_isr)
+void ESP32CDCJtag::WriteFun(WritePort& port, bool in_isr)
 {
   auto* cdc = LibXR::ContainerOf(&port, &ESP32CDCJtag::_write_port);
-  return cdc->TryStartTx(in_isr);
+  cdc->service_.Invoke(EVENT_WRITE, in_isr, [cdc](uint32_t events, bool owner_isr)
+                       { cdc->ServiceEvents(events, owner_isr); });
 }
 
-ErrorCode ESP32CDCJtag::ReadFun(ReadPort&, bool) { return ErrorCode::PENDING; }
-
-void IRAM_ATTR ESP32CDCJtag::ClearActiveTx()
+void ESP32CDCJtag::ResumeRx(bool in_isr)
 {
-  tx_active_ptr_ = nullptr;
-  tx_active_size_ = 0;
-  tx_active_offset_ = 0;
-  tx_active_info_ = {};
-  tx_active_valid_ = false;
+  service_.Invoke(EVENT_RX_SPACE, in_isr, [this](uint32_t events, bool owner_isr)
+                  { ServiceEvents(events, owner_isr); });
 }
 
-void IRAM_ATTR ESP32CDCJtag::ClearPendingTx()
+void ESP32CDCJtag::ServiceEvents(uint32_t events, bool in_isr)
 {
-  tx_pending_ptr_ = nullptr;
-  tx_pending_size_ = 0;
-  tx_pending_info_ = {};
-  tx_pending_valid_ = false;
+  if ((events & EVENT_TX_EMPTY) != 0U)
+  {
+    tx_empty_interrupt_armed_ = false;
+  }
+  if ((events & (EVENT_RX_DATA | EVENT_RX_SPACE)) != 0U)
+  {
+    auto queue = _read_port.GetReadQueue(in_isr);
+    ServiceRx(queue, in_isr);
+    queue.Publish();
+  }
+
+  if ((events & (EVENT_WRITE | EVENT_TX_EMPTY)) != 0U)
+  {
+    ProgressTx(in_isr);
+  }
 }
 
-void IRAM_ATTR ESP32CDCJtag::ResetTxState(bool)
+void ESP32CDCJtag::PushRxBytes(ReadPort::ReadQueue& queue, const uint8_t* data,
+                               size_t size, bool in_isr)
 {
-  ClearActiveTx();
-  ClearPendingTx();
-  tx_busy_.Clear();
+  [[maybe_unused]] const auto push_batch_result = queue.PushBatch(data, size);
+  DEV_ASSERT_FROM_CALLBACK(push_batch_result == ErrorCode::OK, in_isr);
 }
 
-bool IRAM_ATTR ESP32CDCJtag::DequeueTxToSlot(uint8_t* slot, size_t& size,
-                                             WriteInfoBlock& info, bool in_isr)
+void ESP32CDCJtag::DrainRxToQueue(ReadPort::ReadQueue& queue, bool in_isr)
 {
-  (void)in_isr;
-
-  WriteInfoBlock peek_info = {};
-  if (write_port_->queue_info_->Peek(peek_info) != ErrorCode::OK)
+  while (usb_serial_jtag_ll_rxfifo_data_available())
   {
-    return false;
-  }
-
-  if (peek_info.data.size_ > tx_slot_size_)
-  {
-    ASSERT(false);
-    return false;
-  }
-
-  if (write_port_->queue_data_->PopBatch(slot, peek_info.data.size_) != ErrorCode::OK)
-  {
-    return false;
-  }
-
-  if (write_port_->queue_info_->Pop(info) != ErrorCode::OK)
-  {
-    return false;
-  }
-
-  size = peek_info.data.size_;
-  return true;
-}
-
-bool IRAM_ATTR ESP32CDCJtag::LoadActiveTxFromQueue(bool in_isr)
-{
-  if (tx_active_valid_)
-  {
-    return true;
-  }
-
-  size_t active_size = 0U;
-  if (!DequeueTxToSlot(tx_slot_a_, active_size, tx_active_info_, in_isr))
-  {
-    return false;
-  }
-
-  tx_active_ptr_ = tx_slot_a_;
-  tx_active_size_ = active_size;
-  tx_active_valid_ = true;
-  return true;
-}
-
-bool IRAM_ATTR ESP32CDCJtag::LoadPendingTxFromQueue(bool in_isr)
-{
-  if (tx_pending_valid_)
-  {
-    return false;
-  }
-
-  uint8_t* pending_slot = tx_slot_b_;
-  if (tx_active_ptr_ == tx_slot_b_)
-  {
-    pending_slot = tx_slot_a_;
-  }
-
-  size_t pending_size = 0U;
-  if (!DequeueTxToSlot(pending_slot, pending_size, tx_pending_info_, in_isr))
-  {
-    return false;
-  }
-
-  tx_pending_ptr_ = pending_slot;
-  tx_pending_size_ = pending_size;
-  tx_pending_valid_ = true;
-  return true;
-}
-
-bool IRAM_ATTR ESP32CDCJtag::PumpTx(bool)
-{
-  while (tx_busy_.IsSet())
-  {
-    if (!tx_active_valid_ || (tx_active_ptr_ == nullptr) ||
-        (tx_active_offset_ >= tx_active_size_))
-    {
-      tx_busy_.Clear();
-      return true;
-    }
-
-    const uint32_t remain = static_cast<uint32_t>(tx_active_size_ - tx_active_offset_);
-    const int written =
-        usb_serial_jtag_ll_write_txfifo(tx_active_ptr_ + tx_active_offset_, remain);
-    if (written <= 0)
-    {
-      return false;
-    }
-
-    tx_active_offset_ += static_cast<size_t>(written);
-    if (tx_active_offset_ >= tx_active_size_)
-    {
-      tx_busy_.Clear();
-      return true;
-    }
-  }
-
-  return false;
-}
-
-void IRAM_ATTR ESP32CDCJtag::PushRxBytes(const uint8_t* data, size_t size, bool in_isr)
-{
-  size_t offset = 0U;
-  bool pushed_any = false;
-
-  while (offset < size)
-  {
-    const size_t free_space = read_port_->queue_data_->EmptySize();
+    const size_t free_space = queue.EmptySize();
     if (free_space == 0U)
     {
-      break;
+      return;
     }
 
-    const size_t chunk = std::min(free_space, size - offset);
-    if (read_port_->queue_data_->PushBatch(data + offset, chunk) != ErrorCode::OK)
+    uint8_t rx_tmp[ENDPOINT_SIZE] = {};
+    const size_t read_size = std::min(free_space, sizeof(rx_tmp));
+    const int got =
+        usb_serial_jtag_ll_read_rxfifo(rx_tmp, static_cast<uint32_t>(read_size));
+    if (got <= 0)
     {
-      break;
+      return;
     }
-
-    offset += chunk;
-    pushed_any = true;
-  }
-
-  if (pushed_any)
-  {
-    read_port_->ProcessPendingReads(in_isr);
+    DEV_ASSERT_FROM_CALLBACK(static_cast<size_t>(got) <= read_size, in_isr);
+    PushRxBytes(queue, rx_tmp, static_cast<size_t>(got), in_isr);
   }
 }
 
-bool IRAM_ATTR ESP32CDCJtag::StartActiveTransfer(bool in_isr)
+void ESP32CDCJtag::ServiceRx(ReadPort::ReadQueue& queue, bool in_isr)
 {
-  if (!tx_active_valid_ || (tx_active_ptr_ == nullptr) || (tx_active_size_ == 0U))
-  {
-    return false;
-  }
+  DisableInterrupt(RX_INTR_MASK);
+  DrainRxToQueue(queue, in_isr);
 
-  if (tx_busy_.TestAndSet())
+  if (queue.EmptySize() != 0U)
   {
-    return true;
+    EnableInterrupt(RX_INTR_MASK);
   }
-
-  tx_active_offset_ = 0;
-  usb_serial_jtag_ll_ena_intr_mask(kTxIntrMask);
-  (void)PumpTx(in_isr);
-  return true;
 }
 
-bool IRAM_ATTR ESP32CDCJtag::StartAndReportActive(bool in_isr)
+void ESP32CDCJtag::ArmTxEmptyInterrupt()
 {
-  if (!StartActiveTransfer(in_isr))
+  if (!tx_empty_interrupt_armed_)
   {
-    write_port_->Finish(in_isr, ErrorCode::FAILED, tx_active_info_);
-    ClearActiveTx();
-    return false;
+    EnableInterrupt(TX_INTR_MASK);
+    tx_empty_interrupt_armed_ = true;
   }
-
-  // Keep aligned with STM/CH: once next op is kicked to HW, report it finished.
-  write_port_->Finish(in_isr, ErrorCode::OK, tx_active_info_);
-  if (!tx_busy_.IsSet() && tx_active_valid_)
-  {
-    OnTxTransferDone(in_isr, ErrorCode::OK);
-  }
-  return true;
 }
 
-void IRAM_ATTR ESP32CDCJtag::StopTxTransfer()
+void ESP32CDCJtag::DisarmTxEmptyInterrupt()
 {
-  usb_serial_jtag_ll_txfifo_flush();
-  usb_serial_jtag_ll_disable_intr_mask(kTxIntrMask);
-}
-
-void IRAM_ATTR ESP32CDCJtag::OnTxTransferDone(bool in_isr, ErrorCode result)
-{
-  Flag::ScopedRestore tx_flag(in_tx_isr_);
-  tx_busy_.Clear();
-
-  ClearActiveTx();
-
-  if ((result != ErrorCode::OK) && tx_pending_valid_)
+  if (tx_empty_interrupt_armed_)
   {
-    write_port_->Finish(in_isr, ErrorCode::FAILED, tx_pending_info_);
-    ClearPendingTx();
-  }
-
-  if (result != ErrorCode::OK)
-  {
-    StopTxTransfer();
-    return;
-  }
-
-  if (tx_pending_valid_)
-  {
-    tx_active_ptr_ = tx_pending_ptr_;
-    tx_active_size_ = tx_pending_size_;
-    tx_active_info_ = tx_pending_info_;
-    tx_active_valid_ = true;
-    ClearPendingTx();
-    (void)StartAndReportActive(in_isr);
+    DisableAndClearInterrupt(TX_INTR_MASK);
+    tx_empty_interrupt_armed_ = false;
   }
   else
   {
-    if (LoadActiveTxFromQueue(in_isr))
-    {
-      (void)StartAndReportActive(in_isr);
-    }
-  }
-
-  if (!tx_pending_valid_)
-  {
-    (void)LoadPendingTxFromQueue(in_isr);
-  }
-
-  if (!tx_busy_.IsSet() && !tx_active_valid_ && !tx_pending_valid_)
-  {
-    StopTxTransfer();
+    ClearInterrupt(TX_INTR_MASK);
   }
 }
 
-ErrorCode IRAM_ATTR ESP32CDCJtag::TryStartTx(bool in_isr)
+void ESP32CDCJtag::FlushTxFifo()
 {
-  if (in_tx_isr_.IsSet())
+  if (tx_flush_pending_)
   {
-    return ErrorCode::PENDING;
+    usb_serial_jtag_ll_txfifo_flush();
+    tx_flush_pending_ = false;
   }
-
-  if (!tx_active_valid_)
-  {
-    (void)LoadActiveTxFromQueue(in_isr);
-  }
-
-  if (!tx_busy_.IsSet() && tx_active_valid_)
-  {
-    if (!StartActiveTransfer(in_isr))
-    {
-      ClearActiveTx();
-      return ErrorCode::FAILED;
-    }
-
-    if (!tx_busy_.IsSet() && tx_active_valid_)
-    {
-      OnTxTransferDone(in_isr, ErrorCode::OK);
-    }
-
-    if (!tx_pending_valid_)
-    {
-      (void)LoadPendingTxFromQueue(in_isr);
-    }
-    return ErrorCode::OK;
-  }
-
-  if (!tx_pending_valid_)
-  {
-    (void)LoadPendingTxFromQueue(in_isr);
-  }
-
-  return ErrorCode::PENDING;
 }
 
-void IRAM_ATTR ESP32CDCJtag::HandleInterrupt()
+size_t ESP32CDCJtag::FillTxFifo(WritePort::WriteQueue& queue, bool in_isr)
 {
-  const uint32_t status = usb_serial_jtag_ll_get_intsts_mask();
+  return queue.PopWithWriter(
+      ENDPOINT_SIZE,
+      [this, in_isr](const uint8_t* first, size_t first_size, const uint8_t* second,
+                     size_t second_size) -> size_t
+      {
+        auto write_span = [this, in_isr](const uint8_t* data, size_t size) -> size_t
+        {
+          if (size == 0U)
+          {
+            return 0U;
+          }
 
-  const uint32_t rx_status = status & kRxIntrMask;
-  if (rx_status != 0U)
+          const int written =
+              usb_serial_jtag_ll_write_txfifo(data, static_cast<uint32_t>(size));
+          REQUIRE_FROM_CALLBACK(written >= 0, in_isr);
+          DEV_ASSERT_FROM_CALLBACK(static_cast<size_t>(written) <= size, in_isr);
+          return written > 0 ? static_cast<size_t>(written) : 0U;
+        };
+
+        const size_t first_written = write_span(first, first_size);
+        if (first_written != first_size)
+        {
+          tx_flush_pending_ = tx_flush_pending_ || first_written != 0U;
+          return first_written;
+        }
+
+        const size_t second_written = write_span(second, second_size);
+        const size_t accepted = first_written + second_written;
+        tx_flush_pending_ = tx_flush_pending_ || accepted != 0U;
+        return accepted;
+      });
+}
+
+void ESP32CDCJtag::ProgressTx(bool in_isr)
+{
+  if (!usb_serial_jtag_ll_txfifo_writable())
   {
-    usb_serial_jtag_ll_clr_intsts_mask(rx_status);
-
-    uint8_t rx_tmp[64] = {};
-    const int got = usb_serial_jtag_ll_read_rxfifo(rx_tmp, sizeof(rx_tmp));
-    if (got > 0)
-    {
-      PushRxBytes(rx_tmp, static_cast<size_t>(got), true);
-    }
-  }
-
-  const uint32_t tx_status = status & kTxIntrMask;
-  if (tx_status == 0U)
-  {
+    ArmTxEmptyInterrupt();
     return;
   }
 
-  usb_serial_jtag_ll_clr_intsts_mask(tx_status);
-
-  Flag::ScopedRestore tx_flag(in_tx_isr_);
-  const bool was_busy = tx_busy_.IsSet();
-  (void)PumpTx(true);
-  if (was_busy && !tx_busy_.IsSet())
+  size_t accepted = 0U;
   {
-    OnTxTransferDone(true, ErrorCode::OK);
+    auto queue = _write_port.GetWriteQueue(in_isr);
+    if (queue.Empty())
+    {
+      FlushTxFifo();
+      DisarmTxEmptyInterrupt();
+      return;
+    }
+
+    accepted = FillTxFifo(queue, in_isr);
   }
+
+  if (accepted == 0U)
+  {
+    ArmTxEmptyInterrupt();
+    return;
+  }
+
+  if (_write_port.Size() == 0U)
+  {
+    if (usb_serial_jtag_ll_txfifo_writable())
+    {
+      FlushTxFifo();
+      DisarmTxEmptyInterrupt();
+    }
+    else
+    {
+      // 满包需要等下一次 FIFO 可写后再发送结束用的 ZLP。
+      // A full packet needs a later writable turn for its terminating ZLP.
+      ArmTxEmptyInterrupt();
+    }
+  }
+  else
+  {
+    if (usb_serial_jtag_ll_txfifo_writable())
+    {
+      FlushTxFifo();
+    }
+    ArmTxEmptyInterrupt();
+  }
+}
+
+void ESP32CDCJtag::HandleInterrupt()
+{
+  uint32_t status = CaptureInterrupt(ALL_INTR_MASK);
+  while (true)
+  {
+    const uint32_t handled = status & ALL_INTR_MASK;
+    if (handled == 0U)
+    {
+      return;
+    }
+
+    uint32_t events = 0U;
+    if ((handled & RX_INTR_MASK) != 0U)
+    {
+      events |= EVENT_RX_DATA;
+    }
+    if ((handled & TX_INTR_MASK) != 0U)
+    {
+      events |= EVENT_TX_EMPTY;
+    }
+
+    service_.Invoke(events, true, [this](uint32_t owner_events, bool owner_isr)
+                    { ServiceEvents(owner_events, owner_isr); });
+
+    status = CaptureInterrupt(ALL_INTR_MASK);
+  }
+}
+
+void ESP32CDCJtag::EnableInterrupt(uint32_t mask)
+{
+  esp_os_enter_critical_safe(&irq_lock_);
+  usb_serial_jtag_ll_ena_intr_mask(mask);
+  esp_os_exit_critical_safe(&irq_lock_);
+}
+
+void ESP32CDCJtag::DisableInterrupt(uint32_t mask)
+{
+  esp_os_enter_critical_safe(&irq_lock_);
+  usb_serial_jtag_ll_disable_intr_mask(mask);
+  esp_os_exit_critical_safe(&irq_lock_);
+}
+
+void ESP32CDCJtag::ClearInterrupt(uint32_t mask)
+{
+  esp_os_enter_critical_safe(&irq_lock_);
+  usb_serial_jtag_ll_clr_intsts_mask(mask);
+  esp_os_exit_critical_safe(&irq_lock_);
+}
+
+void ESP32CDCJtag::DisableAndClearInterrupt(uint32_t mask)
+{
+  esp_os_enter_critical_safe(&irq_lock_);
+  usb_serial_jtag_ll_disable_intr_mask(mask);
+  usb_serial_jtag_ll_clr_intsts_mask(mask);
+  esp_os_exit_critical_safe(&irq_lock_);
+}
+
+uint32_t ESP32CDCJtag::CaptureInterrupt(uint32_t mask)
+{
+  esp_os_enter_critical_safe(&irq_lock_);
+  const uint32_t handled = usb_serial_jtag_ll_get_intsts_mask() & mask;
+  if (handled != 0U)
+  {
+    usb_serial_jtag_ll_disable_intr_mask(handled);
+    usb_serial_jtag_ll_clr_intsts_mask(handled);
+  }
+  esp_os_exit_critical_safe(&irq_lock_);
+  return handled;
 }
 
 }  // namespace LibXR

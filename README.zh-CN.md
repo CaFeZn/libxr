@@ -51,7 +51,7 @@
 
 ## 数据结构支持
 
-| `Structure` | List | Stack | RBTree | LockFreeQueue | LockFreeList |
+| `Structure` | List | Stack | RBTree | Queue | LockFreeList |
 | ----------- | ---- | ----- | ------ | ------------- | ------------ |
 |             | ✅    | ✅     | ✅      | ✅             | ✅            |
 
@@ -121,14 +121,17 @@ set(LIBXR_DRIVER Linux)
 
 ### 编译为共享/静态库
 
-默认编译为object目标，可以在 CMake 命令行或外部 CMakeLists.txt 中预先指定
+默认编译为静态库，可以在 CMake 命令行或外部 CMakeLists.txt 中预先指定：
 
 ```cmake
 # 编译为共享库
 set(LIBXR_SHARED_BUILD True)
 
-# 编译为静态库
+# 编译为静态库（默认）
 set(LIBXR_STATIC_BUILD True)
+
+# 编译为 object 库
+set(LIBXR_OBJECT_BUILD True)
 ```
 
 ### 禁用Eigen
@@ -145,14 +148,6 @@ set(LIBXR_NO_EIGEN True)
 
 ```cmake
 set(LIBXR_DEFAULT_SCALAR float)
-```
-
-### 内部Printf缓冲区大小
-
-裸机/RTOS默认为128，Linux下默认为1024。此选项影响了LibXR::STDIO::Printf函数的缓冲区大小，设为0可以禁用所有log打印。
-
-```cmake
-set(LIBXR_PRINTF_BUFFER_SIZE 256)
 ```
 
 ### 日志消息最大长度
@@ -182,6 +177,17 @@ set(LIBXR_LOG_LEVEL 4)
 ```cmake
 set(LIBXR_TEST_BUILD True)
 ```
+
+自动测试在 `test/automatic/` 中镜像源码目录和源文件归属。在仓库根目录构建并执行完整测试：
+
+```sh
+cmake -S . -B build -DLIBXR_TEST_BUILD=ON -DLIBXR_DEV_ASSERT_BUILD=ON -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --parallel 8
+ctest --test-dir build --output-on-failure --no-tests=error
+```
+
+CTest 通过 util-linux 的 `script` 程序为运行测试提供所需的伪终端。
+构建矩阵、编译探针及手动测试预留目录说明见 [test/README.md](test/README.md)。
 
 ## 其他工具
 

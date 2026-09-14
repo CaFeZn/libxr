@@ -1,3 +1,7 @@
 #pragma once
 
-#include "../Linux/linux_shared_topic_impl.hpp"
+// 平台 wrapper 先选择本平台 MonotonicTime，shared impl 只复用接口。
+// clang-format off
+#include "monotonic_time.hpp"
+#include "../linux/linux_shared_topic_impl.hpp"
+// clang-format on

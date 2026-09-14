@@ -15,18 +15,14 @@ extern "C" __attribute__((weak)) void vApplicationStackOverflowHook(TaskHandle_t
   static volatile const char* task_name = pcTaskName;
   UNUSED(task_name);
   UNUSED(xTask);
-  ASSERT(false);
+  REQUIRE(false);
 }
 
-// NOLINTNEXTLINE
-extern "C" __attribute__((weak)) BaseType_t xTaskCatchUpTicks(TickType_t)
-{
-  return pdFALSE;
-}
+uint32_t LibXR::libxr_freertos_timebase_tick_offset = 0;
 
 void LibXR::PlatformInit(uint32_t timer_pri, uint32_t timer_stack_depth)
 {
-  if (Timebase::timebase == nullptr)
+  if (!Timebase::IsReady())
   {
     /* You should initialize Timebase first */
     ASSERT(false);
@@ -35,13 +31,10 @@ void LibXR::PlatformInit(uint32_t timer_pri, uint32_t timer_stack_depth)
   LibXR::Timer::priority_ = static_cast<LibXR::Thread::Priority>(timer_pri);
   LibXR::Timer::stack_depth_ = timer_stack_depth;
 
-  int64_t time_need_to_catch_up = static_cast<int64_t>(Timebase::GetMilliseconds()) -
-                                  static_cast<int64_t>(xTaskGetTickCount());
+  uint32_t rtos_tick = static_cast<uint32_t>(xTaskGetTickCount());
+  uint32_t timebase_tick = static_cast<uint32_t>(Timebase::GetMilliseconds());
 
-  if (time_need_to_catch_up > 0)
-  {
-    xTaskCatchUpTicks(time_need_to_catch_up);
-  }
+  libxr_freertos_timebase_tick_offset = rtos_tick - timebase_tick;
 }
 
 #ifndef ESP_PLATFORM
@@ -49,7 +42,7 @@ void* operator new(std::size_t size)
 {
   if (size == 0)
   {
-    return pvPortMalloc(size);
+    size = sizeof(std::size_t);
   }
 
 #ifdef LIBXR_DEBUG_BUILD
@@ -59,7 +52,7 @@ void* operator new(std::size_t size)
 #endif
 
   auto ans = pvPortMalloc(size);
-  ASSERT(ans != nullptr);
+  REQUIRE(ans != nullptr);
   return ans;
 }
 
@@ -85,11 +78,7 @@ void* operator new(std::size_t size, std::align_val_t align)
   std::size_t a = static_cast<std::size_t>(align);
   std::size_t space = size + a + sizeof(void*);
   void* raw = pvPortMalloc(space);
-  if (raw == nullptr)
-  {
-    ASSERT(false);
-    return raw;  // NOLINT
-  }
+  REQUIRE(raw != nullptr);
 
   uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw) + sizeof(void*);
   uintptr_t aligned_addr = (raw_addr + a - 1) & ~(a - 1);

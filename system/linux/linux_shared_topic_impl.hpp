@@ -2,6 +2,15 @@
 
 #if defined(LIBXR_SYSTEM_POSIX_HOST)
 
+#include <fcntl.h>
+#include <linux/futex.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -11,23 +20,14 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <type_traits>
 
-#include <fcntl.h>
-#include <linux/futex.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <time.h>
-#include <unistd.h>
-#include <signal.h>
-
 #include "crc.hpp"
 #include "libxr_def.hpp"
 #include "message.hpp"
-#include "monotonic_time.hpp"
 
 namespace LibXR
 {
@@ -37,9 +37,10 @@ namespace LibXR
  */
 enum class LinuxSharedSubscriberMode : uint8_t
 {
-  BROADCAST_FULL = 0,      ///< 广播到该订阅者，满队列时报错。Broadcast and fail on full.
-  BROADCAST_DROP_OLD = 1,  ///< 广播到该订阅者，满队列时丢最旧。Broadcast and drop oldest on full.
-  BALANCE_RR = 2,          ///< 参与 RR 负载均衡组。Participate in the RR balanced group.
+  BROADCAST_FULL = 0,  ///< 广播到该订阅者，满队列时报错。Broadcast and fail on full.
+  BROADCAST_DROP_OLD =
+      1,           ///< 广播到该订阅者，满队列时丢最旧。Broadcast and drop oldest on full.
+  BALANCE_RR = 2,  ///< 参与 RR 负载均衡组。Participate in the RR balanced group.
 };
 
 /**
@@ -48,9 +49,10 @@ enum class LinuxSharedSubscriberMode : uint8_t
  */
 struct LinuxSharedTopicConfig
 {
-  uint32_t slot_num = 64;  ///< 共享 payload 槽位数。Number of shared payload slots.
+  uint32_t slot_num = 64;       ///< 共享 payload 槽位数。Number of shared payload slots.
   uint32_t subscriber_num = 8;  ///< 最大订阅者数量。Maximum number of subscribers.
-  uint32_t queue_num = 64;      ///< 每订阅者描述符队列长度。Descriptor queue length per subscriber.
+  uint32_t queue_num =
+      64;  ///< 每订阅者描述符队列长度。Descriptor queue length per subscriber.
 };
 
 /**
@@ -93,7 +95,8 @@ class LinuxSharedTopic : public Topic
   /**
    * @class Subscriber
    * @brief 同步订阅者，用于从共享 Topic 中等待并读取消息。
-   *        Synchronous subscriber for waiting on and reading messages from a shared topic.
+   *        Synchronous subscriber for waiting on and reading messages from a shared
+   * topic.
    */
   class Subscriber
   {
@@ -101,7 +104,8 @@ class LinuxSharedTopic : public Topic
     using Data = SharedData;
 
     /**
-     * @brief 默认构造函数，创建空订阅者。Default constructor creating an empty subscriber.
+     * @brief 默认构造函数，创建空订阅者。Default constructor creating an empty
+     * subscriber.
      */
     Subscriber() = default;
 
@@ -113,9 +117,8 @@ class LinuxSharedTopic : public Topic
      * @note 包含动态内存分配。
      *       Contains dynamic memory allocation.
      */
-    explicit Subscriber(const char* name,
-                        LinuxSharedSubscriberMode mode =
-                            LinuxSharedSubscriberMode::BROADCAST_FULL)
+    explicit Subscriber(const char* name, LinuxSharedSubscriberMode mode =
+                                              LinuxSharedSubscriberMode::BROADCAST_FULL)
         : owned_topic_(new LinuxSharedTopic(name))
     {
       if (Attach(*owned_topic_, mode) != ErrorCode::OK)
@@ -153,9 +156,9 @@ class LinuxSharedTopic : public Topic
      * @param topic 已打开的共享 Topic。Opened shared topic.
      * @param mode 订阅模式。Subscriber mode.
      */
-    explicit Subscriber(LinuxSharedTopic& topic,
-                        LinuxSharedSubscriberMode mode =
-                            LinuxSharedSubscriberMode::BROADCAST_FULL)
+    explicit Subscriber(
+        LinuxSharedTopic& topic,
+        LinuxSharedSubscriberMode mode = LinuxSharedSubscriberMode::BROADCAST_FULL)
     {
       (void)Attach(topic, mode);
     }
@@ -184,12 +187,14 @@ class LinuxSharedTopic : public Topic
       subscriber_index_ = other.subscriber_index_;
       current_slot_index_ = other.current_slot_index_;
       current_sequence_ = other.current_sequence_;
+      current_timestamp_ = other.current_timestamp_;
 
       other.topic_ = nullptr;
       other.owned_topic_ = nullptr;
-      other.subscriber_index_ = kInvalidIndex;
-      other.current_slot_index_ = kInvalidIndex;
+      other.subscriber_index_ = INVALID_INDEX;
+      other.current_slot_index_ = INVALID_INDEX;
       other.current_sequence_ = 0;
+      other.current_timestamp_ = MicrosecondTimestamp();
       return *this;
     }
 
@@ -198,10 +203,7 @@ class LinuxSharedTopic : public Topic
      * @return true 订阅者有效。Subscriber is valid.
      * @return false 订阅者无效。Subscriber is invalid.
      */
-    bool Valid() const
-    {
-      return topic_ != nullptr && subscriber_index_ != kInvalidIndex;
-    }
+    bool Valid() const { return topic_ != nullptr && subscriber_index_ != INVALID_INDEX; }
 
     /**
      * @brief 等待一条消息，并把当前订阅者切到该 payload。
@@ -230,6 +232,7 @@ class LinuxSharedTopic : public Topic
           topic_->HoldSlot(subscriber_index_, desc.slot_index);
           current_slot_index_ = desc.slot_index;
           current_sequence_ = desc.sequence;
+          current_timestamp_ = topic_->SlotTimestamp(desc.slot_index);
           return ErrorCode::OK;
         }
 
@@ -244,8 +247,8 @@ class LinuxSharedTopic : public Topic
           wait_ms = static_cast<uint32_t>(deadline_ms - now_ms);
         }
 
-        const ErrorCode wait_ans = topic_->WaitReady(topic_->subscribers_[subscriber_index_],
-                                                     wait_ms);
+        const ErrorCode wait_ans =
+            topic_->WaitReady(topic_->subscribers_[subscriber_index_], wait_ms);
         if (wait_ans == ErrorCode::OK)
         {
           continue;
@@ -300,8 +303,8 @@ class LinuxSharedTopic : public Topic
           wait_ms = static_cast<uint32_t>(deadline_ms - now_ms);
         }
 
-        const ErrorCode wait_ans = topic_->WaitReady(topic_->subscribers_[subscriber_index_],
-                                                     wait_ms);
+        const ErrorCode wait_ans =
+            topic_->WaitReady(topic_->subscribers_[subscriber_index_], wait_ms);
         if (wait_ans == ErrorCode::OK)
         {
           continue;
@@ -315,9 +318,9 @@ class LinuxSharedTopic : public Topic
      * @return 当前消息指针；若未持有消息则返回 nullptr。
      *         Pointer to current payload, or nullptr if none is held.
      */
-    const TopicData* GetData() const
+    TopicData* GetData() const
     {
-      if (!Valid() || current_slot_index_ == kInvalidIndex)
+      if (!Valid() || current_slot_index_ == INVALID_INDEX)
       {
         return nullptr;
       }
@@ -329,6 +332,11 @@ class LinuxSharedTopic : public Topic
      * @brief 获取当前消息序号。Get the sequence number of the current message.
      */
     uint64_t GetSequence() const { return current_sequence_; }
+
+    /**
+     * @brief 获取当前消息时间戳。Get the timestamp of the current message.
+     */
+    MicrosecondTimestamp GetTimestamp() const { return current_timestamp_; }
 
     /**
      * @brief 获取当前待消费描述符数量。Get the number of queued pending descriptors.
@@ -351,7 +359,8 @@ class LinuxSharedTopic : public Topic
     }
 
     /**
-     * @brief 获取该订阅者累计丢弃消息数。Get the accumulated drop count of this subscriber.
+     * @brief 获取该订阅者累计丢弃消息数。Get the accumulated drop count of this
+     * subscriber.
      */
     uint64_t GetDropNum() const
     {
@@ -369,15 +378,16 @@ class LinuxSharedTopic : public Topic
      */
     void Release()
     {
-      if (!Valid() || current_slot_index_ == kInvalidIndex)
+      if (!Valid() || current_slot_index_ == INVALID_INDEX)
       {
         return;
       }
 
       topic_->ClearHeldSlot(subscriber_index_, current_slot_index_);
       topic_->ReleaseSlot(current_slot_index_);
-      current_slot_index_ = kInvalidIndex;
+      current_slot_index_ = INVALID_INDEX;
       current_sequence_ = 0;
+      current_timestamp_ = MicrosecondTimestamp();
     }
 
     /**
@@ -393,9 +403,10 @@ class LinuxSharedTopic : public Topic
 
       topic_->UnregisterBalancedSubscriber(subscriber_index_);
       topic_->subscribers_[subscriber_index_].active.store(0, std::memory_order_release);
-      topic_->subscribers_[subscriber_index_].owner_pid.store(0, std::memory_order_release);
-      topic_->subscribers_[subscriber_index_].owner_starttime.store(0,
-                                                                    std::memory_order_release);
+      topic_->subscribers_[subscriber_index_].owner_pid.store(0,
+                                                              std::memory_order_release);
+      topic_->subscribers_[subscriber_index_].owner_starttime.store(
+          0, std::memory_order_release);
 
       Descriptor desc = {};
       while (topic_->TryPopDescriptor(subscriber_index_, desc) == ErrorCode::OK)
@@ -408,9 +419,10 @@ class LinuxSharedTopic : public Topic
       topic_ = nullptr;
       delete owned_topic_;
       owned_topic_ = nullptr;
-      subscriber_index_ = kInvalidIndex;
-      current_slot_index_ = kInvalidIndex;
+      subscriber_index_ = INVALID_INDEX;
+      current_slot_index_ = INVALID_INDEX;
       current_sequence_ = 0;
+      current_timestamp_ = MicrosecondTimestamp();
     }
 
    private:
@@ -437,13 +449,13 @@ class LinuxSharedTopic : public Topic
         {
           topic.subscribers_[i].queue_head.store(0, std::memory_order_release);
           topic.subscribers_[i].queue_tail.store(0, std::memory_order_release);
-          topic.subscribers_[i].ready_sem_count.store(0, std::memory_order_release);
+          topic.subscribers_[i].ready_signal.store(0, std::memory_order_release);
           topic.subscribers_[i].dropped_messages.store(0, std::memory_order_release);
           topic.subscribers_[i].owner_pid.store(topic.self_identity_.pid,
                                                 std::memory_order_release);
           topic.subscribers_[i].owner_starttime.store(topic.self_identity_.starttime,
                                                       std::memory_order_release);
-          topic.subscribers_[i].held_slot.store(kInvalidIndex, std::memory_order_release);
+          topic.subscribers_[i].held_slot.store(INVALID_INDEX, std::memory_order_release);
           topic.subscribers_[i].mode.store(static_cast<uint32_t>(mode),
                                            std::memory_order_release);
           if (mode == LinuxSharedSubscriberMode::BALANCE_RR)
@@ -453,8 +465,7 @@ class LinuxSharedTopic : public Topic
             {
               topic.subscribers_[i].active.store(0, std::memory_order_release);
               topic.subscribers_[i].owner_pid.store(0, std::memory_order_release);
-              topic.subscribers_[i].owner_starttime.store(0,
-                                                          std::memory_order_release);
+              topic.subscribers_[i].owner_starttime.store(0, std::memory_order_release);
               topic.subscribers_[i].mode.store(
                   static_cast<uint32_t>(LinuxSharedSubscriberMode::BROADCAST_FULL),
                   std::memory_order_release);
@@ -463,8 +474,9 @@ class LinuxSharedTopic : public Topic
           }
           topic_ = &topic;
           subscriber_index_ = i;
-          current_slot_index_ = kInvalidIndex;
+          current_slot_index_ = INVALID_INDEX;
           current_sequence_ = 0;
+          current_timestamp_ = MicrosecondTimestamp();
           return ErrorCode::OK;
         }
       }
@@ -474,9 +486,10 @@ class LinuxSharedTopic : public Topic
 
     LinuxSharedTopic* topic_ = nullptr;
     LinuxSharedTopic* owned_topic_ = nullptr;
-    uint32_t subscriber_index_ = kInvalidIndex;
-    uint32_t current_slot_index_ = kInvalidIndex;
+    uint32_t subscriber_index_ = INVALID_INDEX;
+    uint32_t current_slot_index_ = INVALID_INDEX;
     uint64_t current_sequence_ = 0;
+    MicrosecondTimestamp current_timestamp_;
   };
 
   /**
@@ -497,8 +510,8 @@ class LinuxSharedTopic : public Topic
     SharedData() = default;
 
     /**
-     * @brief 析构函数，自动回收句柄持有的槽位。Destructor automatically releasing the held
-     * slot.
+     * @brief 析构函数，自动回收句柄持有的槽位。Destructor automatically releasing the
+     * held slot.
      */
     ~SharedData() { Reset(); }
 
@@ -526,17 +539,17 @@ class LinuxSharedTopic : public Topic
       subscriber_index_ = other.subscriber_index_;
 
       other.topic_ = nullptr;
-      other.slot_index_ = kInvalidIndex;
+      other.slot_index_ = INVALID_INDEX;
       other.sequence_ = 0;
       other.state_ = SharedDataState::EMPTY;
-      other.subscriber_index_ = kInvalidIndex;
+      other.subscriber_index_ = INVALID_INDEX;
       return *this;
     }
 
     /**
      * @brief 检查句柄是否有效。Checks whether the handle is valid.
      */
-    bool Valid() const { return topic_ != nullptr && slot_index_ != kInvalidIndex; }
+    bool Valid() const { return topic_ != nullptr && slot_index_ != INVALID_INDEX; }
 
     /**
      * @brief 检查句柄是否为空。Checks whether the handle is empty.
@@ -547,6 +560,18 @@ class LinuxSharedTopic : public Topic
      * @brief 获取消息序号。Get the sequence number of the held message.
      */
     uint64_t GetSequence() const { return sequence_; }
+
+    /**
+     * @brief 获取消息时间戳。Get the held message timestamp.
+     */
+    MicrosecondTimestamp GetTimestamp() const
+    {
+      if (!Valid() || state_ != SharedDataState::SUBSCRIBER)
+      {
+        return MicrosecondTimestamp();
+      }
+      return topic_->SlotTimestamp(slot_index_);
+    }
 
     /**
      * @brief 获取可写数据指针。Get a writable pointer to the payload.
@@ -563,11 +588,11 @@ class LinuxSharedTopic : public Topic
     }
 
     /**
-     * @brief 获取只读数据指针。Get a read-only pointer to the payload.
+     * @brief 获取数据指针。Get a pointer to the payload.
      * @return 数据指针；若句柄无效则返回 nullptr。
      *         Payload pointer, or nullptr if the handle is invalid.
      */
-    const TopicData* GetData() const
+    TopicData* GetData() const
     {
       if (!Valid())
       {
@@ -596,10 +621,10 @@ class LinuxSharedTopic : public Topic
         topic_->ReleaseSlot(slot_index_);
       }
       topic_ = nullptr;
-      slot_index_ = kInvalidIndex;
+      slot_index_ = INVALID_INDEX;
       sequence_ = 0;
       state_ = SharedDataState::EMPTY;
-      subscriber_index_ = kInvalidIndex;
+      subscriber_index_ = INVALID_INDEX;
     }
 
    private:
@@ -607,10 +632,10 @@ class LinuxSharedTopic : public Topic
     friend class Subscriber;
 
     LinuxSharedTopic* topic_ = nullptr;
-    uint32_t slot_index_ = kInvalidIndex;
+    uint32_t slot_index_ = INVALID_INDEX;
     uint64_t sequence_ = 0;
     SharedDataState state_ = SharedDataState::EMPTY;
-    uint32_t subscriber_index_ = kInvalidIndex;
+    uint32_t subscriber_index_ = INVALID_INDEX;
   };
 
   /**
@@ -756,7 +781,7 @@ class LinuxSharedTopic : public Topic
 
     data.Reset();
 
-    uint32_t slot_index = kInvalidIndex;
+    uint32_t slot_index = INVALID_INDEX;
     ErrorCode pop_ans = PopFreeSlot(slot_index);
     if (pop_ans != ErrorCode::OK)
     {
@@ -770,12 +795,13 @@ class LinuxSharedTopic : public Topic
 
     slots_[slot_index].refcount.store(0, std::memory_order_release);
     slots_[slot_index].sequence.store(0, std::memory_order_release);
+    slots_[slot_index].timestamp_us = 0;
 
     data.topic_ = this;
     data.slot_index_ = slot_index;
     data.sequence_ = 0;
     data.state_ = SharedDataState::PUBLISHER;
-    data.subscriber_index_ = kInvalidIndex;
+    data.subscriber_index_ = INVALID_INDEX;
     return ErrorCode::OK;
   }
 
@@ -797,15 +823,38 @@ class LinuxSharedTopic : public Topic
     return Publish(topic_data);
   }
 
-  /**
-   * @brief 发布一个已申请好的 payload 句柄。Publish a pre-acquired payload handle.
-   */
-  ErrorCode Publish(SharedData&& data) { return PublishData(data); }
+  ErrorCode Publish(const TopicData& data, MicrosecondTimestamp timestamp)
+  {
+    SharedData topic_data;
+    const ErrorCode acquire_ans = CreateData(topic_data);
+    if (acquire_ans != ErrorCode::OK)
+    {
+      return acquire_ans;
+    }
+
+    *topic_data.GetData() = data;
+    return Publish(topic_data, timestamp);
+  }
 
   /**
    * @brief 发布一个已申请好的 payload 句柄。Publish a pre-acquired payload handle.
    */
-  ErrorCode Publish(SharedData& data) { return PublishData(data); }
+  ErrorCode Publish(SharedData&& data) { return PublishData<false>(data); }
+
+  ErrorCode Publish(SharedData&& data, MicrosecondTimestamp timestamp)
+  {
+    return PublishData<true>(data, timestamp);
+  }
+
+  /**
+   * @brief 发布一个已申请好的 payload 句柄。Publish a pre-acquired payload handle.
+   */
+  ErrorCode Publish(SharedData& data) { return PublishData<false>(data); }
+
+  ErrorCode Publish(SharedData& data, MicrosecondTimestamp timestamp)
+  {
+    return PublishData<true>(data, timestamp);
+  }
 
   /**
    * @brief 获取累计发布失败次数。Get the accumulated publish failure count.
@@ -853,7 +902,7 @@ class LinuxSharedTopic : public Topic
   }
 
  private:
-  struct alignas(64) SharedHeader
+  struct alignas(LibXR::CONCURRENCY_ALIGNMENT) SharedHeader
   {
     uint64_t magic = 0;
     uint64_t name_key = 0;
@@ -873,10 +922,11 @@ class LinuxSharedTopic : public Topic
     std::atomic<uint64_t> publish_failures;
   };
 
-  struct alignas(64) SlotControl
+  struct alignas(LibXR::CONCURRENCY_ALIGNMENT) SlotControl
   {
     std::atomic<uint32_t> refcount;
     std::atomic<uint64_t> sequence;
+    uint64_t timestamp_us;
   };
 
   struct alignas(16) FreeSlotCell
@@ -888,25 +938,26 @@ class LinuxSharedTopic : public Topic
 
   struct Descriptor
   {
-    uint32_t slot_index = kInvalidIndex;
+    uint32_t slot_index = INVALID_INDEX;
     uint32_t reserved = 0;
     uint64_t sequence = 0;
   };
 
-  struct alignas(64) SubscriberControl
+  struct alignas(LibXR::CONCURRENCY_ALIGNMENT) SubscriberControl
   {
     std::atomic<uint32_t> active;
     std::atomic<uint32_t> mode;
     std::atomic<uint32_t> queue_head;
     std::atomic<uint32_t> queue_tail;
-    std::atomic<uint32_t> ready_sem_count;
+    std::atomic<uint32_t>
+        ready_signal;  ///< 唤醒提示，不表示队列长度 / Wake hint, not size.
     std::atomic<uint64_t> dropped_messages;
     std::atomic<uint32_t> owner_pid;
     std::atomic<uint64_t> owner_starttime;
     std::atomic<uint32_t> held_slot;
   };
 
-  struct alignas(64) BalancedGroupControl
+  struct alignas(LibXR::CONCURRENCY_ALIGNMENT) BalancedGroupControl
   {
     std::atomic<uint64_t> rr_cursor;
   };
@@ -917,16 +968,16 @@ class LinuxSharedTopic : public Topic
     uint64_t starttime = 0;
   };
 
-  static constexpr uint64_t kMagic = 0x4c58524950435348ULL;
-  static constexpr uint32_t kVersion = 1;
-  static constexpr uint32_t kInitReady = 1;
-  static constexpr uint32_t kInvalidIndex = UINT32_MAX;
+  static constexpr uint64_t MAGIC = 0x4c58524950435348ULL;
+  static constexpr uint32_t VERSION = 3;
+  static constexpr uint32_t INIT_READY = 1;
+  static constexpr uint32_t INVALID_INDEX = UINT32_MAX;
 
   static uint32_t ResolveDomainKey(const char* domain_name)
   {
-    const std::string resolved =
-        (domain_name == nullptr || domain_name[0] == '\0') ? std::string(DEFAULT_DOMAIN_NAME)
-                                                            : std::string(domain_name);
+    const std::string resolved = (domain_name == nullptr || domain_name[0] == '\0')
+                                     ? std::string(DEFAULT_DOMAIN_NAME)
+                                     : std::string(domain_name);
     return CRC32::Calculate(resolved.data(), resolved.size());
   }
 
@@ -940,7 +991,8 @@ class LinuxSharedTopic : public Topic
     const uint32_t topic_len = static_cast<uint32_t>(topic_name.size());
     std::string key_material;
     key_material.reserve(sizeof(domain_crc32) + sizeof(topic_len) + topic_len);
-    key_material.append(reinterpret_cast<const char*>(&domain_crc32), sizeof(domain_crc32));
+    key_material.append(reinterpret_cast<const char*>(&domain_crc32),
+                        sizeof(domain_crc32));
     key_material.append(reinterpret_cast<const char*>(&topic_len), sizeof(topic_len));
     key_material.append(topic_name.data(), topic_name.size());
     return CRC64::Calculate(key_material.data(), key_material.size());
@@ -959,6 +1011,18 @@ class LinuxSharedTopic : public Topic
   }
 
   static uint64_t NowMonotonicMs() { return MonotonicTime::NowMilliseconds(); }
+
+  static MicrosecondTimestamp NowMessageTimestamp() { return Topic::NowTimestamp(); }
+
+  static uint64_t ToSharedTimestamp(MicrosecondTimestamp timestamp)
+  {
+    return MonotonicTime::XrToSharedMicroseconds(static_cast<uint64_t>(timestamp));
+  }
+
+  static MicrosecondTimestamp FromSharedTimestamp(uint64_t timestamp_us)
+  {
+    return MicrosecondTimestamp(MonotonicTime::SharedToXrMicroseconds(timestamp_us));
+  }
 
   static bool ReadProcessIdentity(uint32_t pid, ProcessIdentity& identity)
   {
@@ -1010,7 +1074,8 @@ class LinuxSharedTopic : public Topic
     return false;
   }
 
-  static int FutexWait(std::atomic<uint32_t>* word, uint32_t expected, uint32_t timeout_ms)
+  static int FutexWait(std::atomic<uint32_t>* word, uint32_t expected,
+                       uint32_t timeout_ms)
   {
     struct timespec timeout = {};
     struct timespec* timeout_ptr = nullptr;
@@ -1021,26 +1086,18 @@ class LinuxSharedTopic : public Topic
       timeout_ptr = &timeout;
     }
 
-    return static_cast<int>(syscall(SYS_futex,
-                                    reinterpret_cast<uint32_t*>(word),
-                                    FUTEX_WAIT,
-                                    expected,
-                                    timeout_ptr,
-                                    nullptr,
-                                    0));
+    return static_cast<int>(syscall(SYS_futex, reinterpret_cast<uint32_t*>(word),
+                                    FUTEX_WAIT, expected, timeout_ptr, nullptr, 0));
   }
 
   static int FutexWake(std::atomic<uint32_t>* word)
   {
-    return static_cast<int>(
-        syscall(SYS_futex, reinterpret_cast<uint32_t*>(word), FUTEX_WAKE, INT32_MAX, nullptr,
-                nullptr, 0));
+    return static_cast<int>(syscall(SYS_futex, reinterpret_cast<uint32_t*>(word),
+                                    FUTEX_WAKE, INT32_MAX, nullptr, nullptr, 0));
   }
 
-  static size_t ComputeSharedBytes(uint32_t slot_count,
-                                   uint32_t subscriber_capacity,
-                                   uint32_t queue_capacity,
-                                   uint32_t topic_name_len)
+  static size_t ComputeSharedBytes(uint32_t slot_count, uint32_t subscriber_capacity,
+                                   uint32_t queue_capacity, uint32_t topic_name_len)
   {
     size_t offset = 0;
     offset = AlignUp(offset, alignof(SharedHeader));
@@ -1169,17 +1226,18 @@ class LinuxSharedTopic : public Topic
     header_->topic_name_len = static_cast<uint32_t>(topic_name_.size());
     SetupPointers();
 
-    header_->magic = kMagic;
+    header_->magic = MAGIC;
     header_->name_key = name_key_;
     header_->domain_crc32 = domain_crc32_;
-    header_->version = kVersion;
+    header_->version = VERSION;
     header_->data_size = sizeof(TopicData);
     header_->slot_count = slot_count_;
     header_->subscriber_capacity = subscriber_capacity_;
     header_->queue_capacity = queue_capacity_;
     std::memcpy(topic_name_ptr_, topic_name_.c_str(), topic_name_.size() + 1U);
     header_->publisher_pid.store(self_identity_.pid, std::memory_order_release);
-    header_->publisher_starttime.store(self_identity_.starttime, std::memory_order_release);
+    header_->publisher_starttime.store(self_identity_.starttime,
+                                       std::memory_order_release);
     header_->free_queue_head.store(0, std::memory_order_release);
     header_->free_queue_tail.store(slot_count_, std::memory_order_release);
     header_->next_sequence.store(0, std::memory_order_release);
@@ -1189,7 +1247,8 @@ class LinuxSharedTopic : public Topic
     {
       slots_[i].refcount.store(0, std::memory_order_release);
       slots_[i].sequence.store(0, std::memory_order_release);
-      std::memset(&payloads_[i], 0, sizeof(TopicData));
+      slots_[i].timestamp_us = 0;
+      std::construct_at(&payloads_[i], TopicData{});
       free_slots_[i].slot_index = i;
       free_slots_[i].sequence.store(static_cast<uint64_t>(i) + 1U,
                                     std::memory_order_release);
@@ -1198,26 +1257,28 @@ class LinuxSharedTopic : public Topic
     for (uint32_t i = 0; i < subscriber_capacity_; ++i)
     {
       subscribers_[i].active.store(0, std::memory_order_release);
-      subscribers_[i].mode.store(static_cast<uint32_t>(LinuxSharedSubscriberMode::BROADCAST_FULL),
-                                 std::memory_order_release);
+      subscribers_[i].mode.store(
+          static_cast<uint32_t>(LinuxSharedSubscriberMode::BROADCAST_FULL),
+          std::memory_order_release);
       subscribers_[i].queue_head.store(0, std::memory_order_release);
       subscribers_[i].queue_tail.store(0, std::memory_order_release);
-      subscribers_[i].ready_sem_count.store(0, std::memory_order_release);
+      subscribers_[i].ready_signal.store(0, std::memory_order_release);
       subscribers_[i].dropped_messages.store(0, std::memory_order_release);
       subscribers_[i].owner_pid.store(0, std::memory_order_release);
       subscribers_[i].owner_starttime.store(0, std::memory_order_release);
-      subscribers_[i].held_slot.store(kInvalidIndex, std::memory_order_release);
-      balanced_members_[i].store(kInvalidIndex, std::memory_order_release);
+      subscribers_[i].held_slot.store(INVALID_INDEX, std::memory_order_release);
+      balanced_members_[i].store(INVALID_INDEX, std::memory_order_release);
     }
 
     balanced_group_->rr_cursor.store(0, std::memory_order_release);
 
-    for (size_t i = 0; i < static_cast<size_t>(subscriber_capacity_) * queue_capacity_; ++i)
+    for (size_t i = 0; i < static_cast<size_t>(subscriber_capacity_) * queue_capacity_;
+         ++i)
     {
       descriptors_[i] = Descriptor{};
     }
 
-    header_->init_state.store(kInitReady, std::memory_order_release);
+    header_->init_state.store(INIT_READY, std::memory_order_release);
     return ErrorCode::OK;
   }
 
@@ -1240,12 +1301,12 @@ class LinuxSharedTopic : public Topic
     base_ = static_cast<uint8_t*>(mapping_);
     header_ = reinterpret_cast<SharedHeader*>(base_);
 
-    while (header_->init_state.load(std::memory_order_acquire) != kInitReady)
+    while (header_->init_state.load(std::memory_order_acquire) != INIT_READY)
     {
       usleep(1000);
     }
 
-    if (header_->magic != kMagic || header_->version != kVersion ||
+    if (header_->magic != MAGIC || header_->version != VERSION ||
         header_->data_size != sizeof(TopicData))
     {
       return ErrorCode::CHECK_ERR;
@@ -1284,8 +1345,8 @@ class LinuxSharedTopic : public Topic
     }
     else
     {
-      void* mapping = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ | PROT_WRITE,
-                           MAP_SHARED, stale_fd, 0);
+      void* mapping = mmap(nullptr, static_cast<size_t>(st.st_size),
+                           PROT_READ | PROT_WRITE, MAP_SHARED, stale_fd, 0);
       if (mapping != MAP_FAILED)
       {
         uint8_t* base = static_cast<uint8_t*>(mapping);
@@ -1294,7 +1355,7 @@ class LinuxSharedTopic : public Topic
         bool identity_match = false;
         const size_t mapping_size = static_cast<size_t>(st.st_size);
         const size_t topic_name_bytes = topic_name_.size() + 1U;
-        if (header->magic == kMagic && header->version == kVersion &&
+        if (header->magic == MAGIC && header->version == VERSION &&
             header->domain_crc32 == domain_crc32_ &&
             header->topic_name_len == topic_name_.size())
         {
@@ -1317,7 +1378,7 @@ class LinuxSharedTopic : public Topic
         {
           reclaim = false;
         }
-        else if (init_state != kInitReady)
+        else if (init_state != INIT_READY)
         {
           reclaim = !ProcessAlive(publisher_identity);
         }
@@ -1456,14 +1517,19 @@ class LinuxSharedTopic : public Topic
   {
     uint32_t expected = slot_index;
     subscribers_[subscriber_index].held_slot.compare_exchange_strong(
-        expected, kInvalidIndex, std::memory_order_acq_rel, std::memory_order_relaxed);
+        expected, INVALID_INDEX, std::memory_order_acq_rel, std::memory_order_relaxed);
+  }
+
+  MicrosecondTimestamp SlotTimestamp(uint32_t slot_index) const
+  {
+    return FromSharedTimestamp(slots_[slot_index].timestamp_us);
   }
 
   ErrorCode RegisterBalancedSubscriber(uint32_t subscriber_index)
   {
     for (uint32_t i = 0; i < subscriber_capacity_; ++i)
     {
-      uint32_t expected = kInvalidIndex;
+      uint32_t expected = INVALID_INDEX;
       if (balanced_members_[i].compare_exchange_strong(expected, subscriber_index,
                                                        std::memory_order_acq_rel,
                                                        std::memory_order_relaxed))
@@ -1479,7 +1545,7 @@ class LinuxSharedTopic : public Topic
     for (uint32_t i = 0; i < subscriber_capacity_; ++i)
     {
       uint32_t expected = subscriber_index;
-      if (balanced_members_[i].compare_exchange_strong(expected, kInvalidIndex,
+      if (balanced_members_[i].compare_exchange_strong(expected, INVALID_INDEX,
                                                        std::memory_order_acq_rel,
                                                        std::memory_order_relaxed))
       {
@@ -1490,12 +1556,14 @@ class LinuxSharedTopic : public Topic
 
   bool SelectBalancedSubscriber(uint32_t& subscriber_index)
   {
-    const uint64_t base = balanced_group_->rr_cursor.fetch_add(1, std::memory_order_acq_rel);
+    const uint64_t base =
+        balanced_group_->rr_cursor.fetch_add(1, std::memory_order_acq_rel);
     for (uint32_t offset = 0; offset < subscriber_capacity_; ++offset)
     {
       const uint32_t member_index =
-          balanced_members_[(base + offset) % subscriber_capacity_].load(std::memory_order_acquire);
-      if (member_index == kInvalidIndex)
+          balanced_members_[(base + offset) % subscriber_capacity_].load(
+              std::memory_order_acquire);
+      if (member_index == INVALID_INDEX)
       {
         continue;
       }
@@ -1508,6 +1576,19 @@ class LinuxSharedTopic : public Topic
       {
         continue;
       }
+      const ProcessIdentity owner_identity = {
+          subscribers_[member_index].owner_pid.load(std::memory_order_acquire),
+          subscribers_[member_index].owner_starttime.load(std::memory_order_acquire),
+      };
+      if (owner_identity.pid == 0 || owner_identity.starttime == 0)
+      {
+        continue;
+      }
+      if (!ProcessAlive(owner_identity))
+      {
+        ReclaimSubscriber(member_index);
+        continue;
+      }
       if (!QueueHasSpace(member_index))
       {
         continue;
@@ -1518,21 +1599,58 @@ class LinuxSharedTopic : public Topic
     return false;
   }
 
-  static void PostReady(SubscriberControl& control)
+  bool ReclaimSubscriber(uint32_t subscriber_index)
   {
-    control.ready_sem_count.fetch_add(1, std::memory_order_release);
-    FutexWake(&control.ready_sem_count);
+    uint32_t expected = 1;
+    if (!subscribers_[subscriber_index].active.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel, std::memory_order_relaxed))
+    {
+      return false;
+    }
+
+    if (subscribers_[subscriber_index].mode.load(std::memory_order_acquire) ==
+        static_cast<uint32_t>(LinuxSharedSubscriberMode::BALANCE_RR))
+    {
+      UnregisterBalancedSubscriber(subscriber_index);
+    }
+
+    subscribers_[subscriber_index].owner_pid.store(0, std::memory_order_release);
+    subscribers_[subscriber_index].owner_starttime.store(0, std::memory_order_release);
+    subscribers_[subscriber_index].mode.store(
+        static_cast<uint32_t>(LinuxSharedSubscriberMode::BROADCAST_FULL),
+        std::memory_order_release);
+
+    const uint32_t held_slot = subscribers_[subscriber_index].held_slot.exchange(
+        INVALID_INDEX, std::memory_order_acq_rel);
+    if (held_slot != INVALID_INDEX)
+    {
+      ReleaseSlot(held_slot);
+    }
+
+    Descriptor desc = {};
+    while (TryPopDescriptor(subscriber_index, desc) == ErrorCode::OK)
+    {
+      ReleaseSlot(desc.slot_index);
+    }
+
+    return true;
   }
 
-  static void ConsumeReady(SubscriberControl& control)
+  static void PostReady(SubscriberControl& control)
   {
-    const uint32_t prev = control.ready_sem_count.fetch_sub(1, std::memory_order_acq_rel);
-    ASSERT(prev > 0);
+    control.ready_signal.store(1, std::memory_order_release);
+    FutexWake(&control.ready_signal);
+  }
+
+  static bool HasQueuedData(const SubscriberControl& control)
+  {
+    return control.queue_head.load(std::memory_order_acquire) !=
+           control.queue_tail.load(std::memory_order_acquire);
   }
 
   static ErrorCode WaitReady(SubscriberControl& control, uint32_t timeout_ms)
   {
-    if (control.ready_sem_count.load(std::memory_order_acquire) != 0)
+    if (HasQueuedData(control))
     {
       return ErrorCode::OK;
     }
@@ -1542,7 +1660,10 @@ class LinuxSharedTopic : public Topic
 
     while (true)
     {
-      if (control.ready_sem_count.load(std::memory_order_acquire) != 0)
+      // 先清提示再检查队列，覆盖检查与进入 futex 等待之间的发布。
+      // Clear the hint before checking the queue so a later publication prevents sleep.
+      control.ready_signal.exchange(0, std::memory_order_acq_rel);
+      if (HasQueuedData(control))
       {
         return ErrorCode::OK;
       }
@@ -1559,7 +1680,7 @@ class LinuxSharedTopic : public Topic
 
       wait_ms = MonotonicTime::WaitSliceMilliseconds(wait_ms);
 
-      const int futex_ans = FutexWait(&control.ready_sem_count, 0, wait_ms);
+      const int futex_ans = FutexWait(&control.ready_signal, 0, wait_ms);
       if (futex_ans == 0 || errno == EAGAIN || errno == EINTR)
       {
         continue;
@@ -1572,7 +1693,7 @@ class LinuxSharedTopic : public Topic
           continue;
         }
         if (MonotonicTime::RemainingMilliseconds(deadline_ms) == 0 &&
-            control.ready_sem_count.load(std::memory_order_acquire) == 0)
+            !HasQueuedData(control))
         {
           return ErrorCode::TIMEOUT;
         }
@@ -1601,28 +1722,7 @@ class LinuxSharedTopic : public Topic
         continue;
       }
 
-      uint32_t expected = 1;
-      if (!subscribers_[i].active.compare_exchange_strong(expected, 0, std::memory_order_acq_rel,
-                                                          std::memory_order_relaxed))
-      {
-        continue;
-      }
-
-      subscribers_[i].owner_pid.store(0, std::memory_order_release);
-      subscribers_[i].owner_starttime.store(0, std::memory_order_release);
-
-      const uint32_t held_slot =
-          subscribers_[i].held_slot.exchange(kInvalidIndex, std::memory_order_acq_rel);
-      if (held_slot != kInvalidIndex)
-      {
-        ReleaseSlot(held_slot);
-      }
-
-      Descriptor desc = {};
-      while (TryPopDescriptor(i, desc) == ErrorCode::OK)
-      {
-        ReleaseSlot(desc.slot_index);
-      }
+      ReclaimSubscriber(i);
     }
   }
 
@@ -1663,10 +1763,9 @@ class LinuxSharedTopic : public Topic
 
       descriptor = ring[head];
       const uint32_t next_head = (head + 1U) % queue_capacity_;
-      if (control.queue_head.compare_exchange_weak(head, next_head, std::memory_order_acq_rel,
-                                                   std::memory_order_relaxed))
+      if (control.queue_head.compare_exchange_weak(
+              head, next_head, std::memory_order_acq_rel, std::memory_order_relaxed))
       {
-        ConsumeReady(control);
         return ErrorCode::OK;
       }
     }
@@ -1688,11 +1787,10 @@ class LinuxSharedTopic : public Topic
 
       const Descriptor descriptor = ring[head];
       const uint32_t next_head = (head + 1U) % queue_capacity_;
-      if (control.queue_head.compare_exchange_weak(head, next_head, std::memory_order_acq_rel,
-                                                   std::memory_order_relaxed))
+      if (control.queue_head.compare_exchange_weak(
+              head, next_head, std::memory_order_acq_rel, std::memory_order_relaxed))
       {
         control.dropped_messages.fetch_add(1, std::memory_order_relaxed);
-        ConsumeReady(control);
         ReleaseSlot(descriptor.slot_index);
         return ErrorCode::OK;
       }
@@ -1710,9 +1808,8 @@ class LinuxSharedTopic : public Topic
 
       if (diff == 0)
       {
-        if (header_->free_queue_head.compare_exchange_weak(head, head + 1U,
-                                                           std::memory_order_acq_rel,
-                                                           std::memory_order_relaxed))
+        if (header_->free_queue_head.compare_exchange_weak(
+                head, head + 1U, std::memory_order_acq_rel, std::memory_order_relaxed))
         {
           slot_index = cell.slot_index;
           cell.sequence.store(head + slot_count_, std::memory_order_release);
@@ -1729,6 +1826,7 @@ class LinuxSharedTopic : public Topic
   void RecycleSlot(uint32_t slot_index)
   {
     slots_[slot_index].sequence.store(0, std::memory_order_release);
+    slots_[slot_index].timestamp_us = 0;
 
     while (true)
     {
@@ -1739,9 +1837,8 @@ class LinuxSharedTopic : public Topic
 
       if (diff == 0)
       {
-        if (header_->free_queue_tail.compare_exchange_weak(tail, tail + 1U,
-                                                           std::memory_order_acq_rel,
-                                                           std::memory_order_relaxed))
+        if (header_->free_queue_tail.compare_exchange_weak(
+                tail, tail + 1U, std::memory_order_acq_rel, std::memory_order_relaxed))
         {
           cell.slot_index = slot_index;
           cell.sequence.store(tail + 1U, std::memory_order_release);
@@ -1753,15 +1850,18 @@ class LinuxSharedTopic : public Topic
 
   void ReleaseSlot(uint32_t slot_index)
   {
-    const uint32_t prev = slots_[slot_index].refcount.fetch_sub(1, std::memory_order_acq_rel);
-    ASSERT(prev > 0);
+    const uint32_t prev =
+        slots_[slot_index].refcount.fetch_sub(1, std::memory_order_acq_rel);
+    DEV_ASSERT(prev > 0);
     if (prev == 1)
     {
       RecycleSlot(slot_index);
     }
   }
 
-  ErrorCode PublishData(SharedData& data)
+  template <bool HAS_TIMESTAMP>
+  ErrorCode PublishData(SharedData& data,
+                        MicrosecondTimestamp timestamp = MicrosecondTimestamp())
   {
     if (!data.Valid() || data.topic_ != this)
     {
@@ -1769,7 +1869,7 @@ class LinuxSharedTopic : public Topic
     }
 
     uint32_t active_count = 0;
-    uint32_t balanced_target = kInvalidIndex;
+    uint32_t balanced_target = INVALID_INDEX;
     bool has_balanced_subscriber = false;
     for (uint32_t i = 0; i < subscriber_capacity_; ++i)
     {
@@ -1796,7 +1896,13 @@ class LinuxSharedTopic : public Topic
 
         if (mode == LinuxSharedSubscriberMode::BROADCAST_DROP_OLD)
         {
-          if (DropDescriptor(i) != ErrorCode::OK)
+          const ErrorCode drop_ans = DropDescriptor(i);
+          if (drop_ans == ErrorCode::EMPTY && QueueHasSpace(i))
+          {
+            // 消费者可能在 QueueHasSpace() 和 DropDescriptor() 之间弹走旧描述符。
+            // 此时队列已经有空位，发布者继续写入即可，不能把竞态误报成 FULL。
+          }
+          else if (drop_ans != ErrorCode::OK)
           {
             header_->publish_failures.fetch_add(1, std::memory_order_relaxed);
             data.Reset();
@@ -1838,8 +1944,13 @@ class LinuxSharedTopic : public Topic
 
     const uint64_t sequence =
         header_->next_sequence.fetch_add(1, std::memory_order_acq_rel) + 1ULL;
+    if constexpr (!HAS_TIMESTAMP)
+    {
+      timestamp = NowMessageTimestamp();
+    }
     SlotControl& slot = slots_[data.slot_index_];
     slot.refcount.store(active_count, std::memory_order_release);
+    slot.timestamp_us = ToSharedTimestamp(timestamp);
     slot.sequence.store(sequence, std::memory_order_release);
 
     const Descriptor descriptor = {data.slot_index_, 0U, sequence};
@@ -1858,13 +1969,13 @@ class LinuxSharedTopic : public Topic
       PushDescriptor(i, descriptor);
     }
 
-    if (balanced_target != kInvalidIndex)
+    if (balanced_target != INVALID_INDEX)
     {
       PushDescriptor(balanced_target, descriptor);
     }
 
     data.topic_ = nullptr;
-    data.slot_index_ = kInvalidIndex;
+    data.slot_index_ = INVALID_INDEX;
     return ErrorCode::OK;
   }
 
@@ -1898,7 +2009,6 @@ class LinuxSharedTopic : public Topic
 
   bool open_ok_ = false;
   ErrorCode open_status_ = ErrorCode::STATE_ERR;
-
 };
 
 }  // namespace LibXR
